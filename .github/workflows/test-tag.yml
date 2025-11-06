@@ -1,0 +1,146 @@
+name: Test Git Tag Creation
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - beta
+  workflow_dispatch:
+    inputs:
+      test_tag_name:
+        description: 'Test tag name (e.g., test-v1.0.0)'
+        required: true
+        default: 'test-tag-1.0.0'
+
+jobs:
+  test-tag-creation:
+    runs-on: UE-Dev-Runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Display Git Status
+        run: |
+          Write-Host "=== Git Status ==="
+          git status
+          Write-Host ""
+          Write-Host "=== Current Branch ==="
+          git branch
+          Write-Host ""
+          Write-Host "=== Remote Info ==="
+          git remote -v
+          Write-Host ""
+          Write-Host "=== Existing Tags ==="
+          git tag -l
+        shell: pwsh
+
+      - name: Configure Git
+        run: |
+          Write-Host "Configuring Git user..."
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          Write-Host "Git configured successfully"
+        shell: pwsh
+
+      - name: Create Test Tag
+        run: |
+          $tagName = "${{ github.event.inputs.test_tag_name }}"
+          if (-not $tagName) {
+            $tagName = "test-tag-auto-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          }
+          Write-Host "Creating tag: $tagName"
+          
+          # Check if tag already exists
+          $existingTag = git tag -l $tagName
+          if ($existingTag) {
+            Write-Host "Tag '$tagName' already exists. Deleting it first..."
+            git tag -d $tagName
+            git push origin --delete $tagName 2>$null
+            Write-Host "Existing tag deleted"
+          }
+          
+          # Create new tag
+          git tag $tagName
+          Write-Host "Tag created locally"
+          
+          # Show tag info
+          git show $tagName --no-patch
+        shell: pwsh
+
+      - name: Push Test Tag
+        run: |
+          $tagName = "${{ github.event.inputs.test_tag_name }}"
+          if (-not $tagName) {
+            $tagName = "test-tag-auto-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          }
+          Write-Host "Pushing tag: $tagName to origin..."
+          
+          # Add timeout to prevent hanging
+          $pushJob = Start-Job -ScriptBlock {
+            param($tag)
+            git push origin $tag 2>&1
+          } -ArgumentList $tagName
+          
+          # Wait for 30 seconds max
+          $completed = Wait-Job -Job $pushJob -Timeout 30
+          
+          if ($completed) {
+            $output = Receive-Job -Job $pushJob
+            Write-Host "Push output:"
+            Write-Host $output
+            
+            if ($pushJob.State -eq "Completed") {
+              Write-Host "✅ Tag pushed successfully!"
+            } else {
+              Write-Host "❌ Tag push failed!"
+              exit 1
+            }
+          } else {
+            Write-Host "❌ Tag push timed out after 30 seconds!"
+            Stop-Job -Job $pushJob
+            Remove-Job -Job $pushJob
+            exit 1
+          }
+          
+          Remove-Job -Job $pushJob -Force
+        shell: pwsh
+
+      - name: Verify Tag Exists on Remote
+        run: |
+          $tagName = "${{ github.event.inputs.test_tag_name }}"
+          if (-not $tagName) {
+            $tagName = "test-tag-auto-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          }
+          Write-Host "Fetching tags from remote..."
+          git fetch --tags
+          
+          Write-Host "Verifying tag exists on remote..."
+          $remoteTag = git ls-remote --tags origin $tagName
+          
+          if ($remoteTag) {
+            Write-Host "✅ SUCCESS: Tag '$tagName' exists on remote!"
+            Write-Host "Remote tag info:"
+            Write-Host $remoteTag
+          } else {
+            Write-Host "❌ FAILED: Tag '$tagName' not found on remote!"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Cleanup Test Tag (Optional)
+        if: always()
+        run: |
+          $tagName = "${{ github.event.inputs.test_tag_name }}"
+          if (-not $tagName) {
+            $tagName = "test-tag-auto-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          }
+          Write-Host "Do you want to keep the test tag? (It will remain unless you manually delete it)"
+          Write-Host "To delete manually, run:"
+          Write-Host "  git tag -d $tagName"
+          Write-Host "  git push origin --delete $tagName"
+        shell: pwsh
+

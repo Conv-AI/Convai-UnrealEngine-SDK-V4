@@ -1,0 +1,218 @@
+{
+  "$schema": "_theme.schema.json",
+  "info": {
+    "id": "dark",
+    "label": "Convai Dark",
+    "version": 1,
+    "inherits": null
+  },
+  "tokens": {
+    "color": {
+      "surface": {
+        "header": "#0C0C0C",
+        "window": "#0C0C0C",
+        "content": "#0F0F0F",
+        "dropdown": "#121212",
+        "scrollBarTrack": "#1A1A1A",
+        "separator": "#FFFFFF",
+        "panel": "#171717"
+      },
+      "divider": {
+        "windowControl": "#FFFFFF40",
+        "general": "#FFFFFF",
+        "headerNav": "#FFFFFF"
+      },
+      "text": {
+        "primary": "#FFFFFF",
+        "secondary": "#CCCCCC",
+        "dropdown": "#FFFFFF",
+        "dropdownHover": "#11FF00",
+        "sampleCard": "#FFFFFF",
+        "accountSection": "#FFFFFF",
+        "info": "#CCCCCC"
+      },
+      "action": {
+        "hover": "#11FF00",
+        "active": "#35FF66"
+      },
+      "border": {
+        "accent": "#1FB755",
+        "primary": "#1FB755",
+        "light": "#BCDBC7"
+      },
+      "windowControl": {
+        "normal": "#FFFFFF",
+        "hover": "#FFFFFF",
+        "active": "#FFFFFF",
+        "background": {
+          "normal": "#00000000",
+          "hover": "#232323",
+          "active": "#232323"
+        },
+        "close": {
+          "normal": "#FFFFFF",
+          "hover": "#FFFFFF",
+          "active": "#FFFFFF",
+          "background": {
+            "normal": "#00000000",
+            "hover": "#FF4444",
+            "active": "#FF6666"
+          }
+        }
+      },
+      "component": {
+        "accountMenu": {
+          "bg": "#121212",
+          "itemBgHover": "#1A1A1A",
+          "textPrimary": "#FFFFFF",
+          "textSecondary": "#AAAAAA",
+          "divider": "#333333",
+          "manageAccountBg": "#00000000",
+          "manageAccountBgHover": "#032346",
+          "manageAccountBorder": "#0A7ABF",
+          "manageAccountText": "#0A7ABF",
+          "manageAccountTextHover": "#69ACED",
+          "manageAccountBorderHover": "#156DC3",
+          "signOutTextHover": "#FF4444"
+        },
+        "dialog": {
+          "windowBg": "#0C0C0C",
+          "surfaceBg": "#121212",
+          "inputBg": "#1A1A1A",
+          "borderAccent": "#1FB755",
+          "textPrimary": "#FFFFFF",
+          "textSecondary": "#CCCCCC",
+          "textHint": "#888888",
+          "buttonSecondary": "#333333",
+          "accentGreen": "#1FB755",
+          "accentGreenBright": "#11FF00"
+        },
+        "form": {
+          "severityCritical": "#EF4444",
+          "severityHigh": "#F59E0B",
+          "severityMedium": "#EAB308",
+          "severityLow": "#22C55E",
+          "categoryConnection": "#F59E0B",
+          "categoryCrash": "#EF4444",
+          "categoryAudio": "#8B5CF6",
+          "categoryCharacter": "#3B82F6",
+          "categorySettings": "#6B7280",
+          "categoryBug": "#EF4444",
+          "categoryFeature": "#22C55E"
+        },
+        "sampleCard": {
+          "bg": "#121212",
+          "outline": "#11FF00",
+          "tagBg": "#242424",
+          "tagText": "#FFFFFF"
+        },
+        "account": {
+          "boxBorder": "#1FB755",
+          "boxBackground": "#0C0C0C",
+          "progressFill": "#11FF00",
+          "progressTrack": "#D9D9D9",
+          "keyBackground": "#121212"
+        },
+        "dropdown": {
+          "itemBgHover": "#11FF00"
+        },
+        "button": {
+          "primary": {
+            "text": "#FFFFFF",
+            "bg": "#1FB755"
+          },
+          "secondary": {
+            "text": "#FFFFFF",
+            "bg": "#333333"
+          },
+          "positive": {
+            "text": "#FFFFFF",
+            "bg": "#22C55E"
+          },
+          "negative": {
+            "text": "#FFFFFF",
+            "bg": "#EF4444"
+          },
+          "disabled": {
+            "text": "#94A3B8",
+            "bg": "#334155"
+          }
+        },
+        "standardCard": {
+          "outline": "#1FB755"
+        },
+        "devInfoBox": {
+          "bg": "#000000"
+        },
+        "loadingIndicator": {
+          "spinner": "#11FF00",
+          "overlay": "#0C0C0CEB",
+          "text": "#CCCCCC"
+        }
+      },
+      "icon": {
+        "base": "#FFFFFF",
+        "scrollBarThumb": "#11FF00"
+      },
+      "feature": {
+        "active": "#11FF00",
+        "inactive": "#4D4D4D"
+      },
+      "headerBg": "#0C0C0C",
+      "separator": "#FFFFFF",
+      "contentBackground": "#0F0F0F",
+      "windowBackground": "#0C0C0C",
+      "navText": "#FFFFFF",
+      "navHover": "#11FF00",
+      "navActive": "#35FF66",
+      "dropdownBg": "#121212",
+      "dropdownText": "#FFFFFF",
+      "dropdownTextHover": "#11FF00",
+      "dropdownItemBgHover": "#11FF00",
+      "sampleCardOutline": "#11FF00",
+      "sampleCardBackground": "#121212",
+      "sampleCardText": "#FFFFFF",
+      "sampleCardTagBackground": "#242424",
+      "sampleCardTagText": "#FFFFFF",
+      "accountSectionTitle": "#FFFFFF",
+      "accountBoxBackground": "#0C0C0C",
+      "accountBoxBorder": "#1FB755",
+      "iconColor": "#FFFFFF",
+      "accountKeyBackground": "#121212",
+      "accountProgressBarTrack": "#D9D9D9",
+      "accountProgressBarFill": "#11FF00",
+      "standardCardOutline": "#1FB755",
+      "ButtonTextPrimary": "#FFFFFF",
+      "ButtonBgPrimary": "#11FF00",
+      "ButtonTextSecondary": "#FFFFFF",
+      "ButtonBgSecondary": "#333333",
+      "scrollBarTrack": "#1A1A1A",
+      "scrollBarThumb": "#11FF00",
+      "Error": "#FF4444",
+      "button": {
+        "primary": "#11FF00",
+        "secondary": "#333333"
+      }
+    }
+  },
+  "brushes": {
+    "Convai.Logo": "Icons/ConvaiLogo.png",
+    "Convai.Gradient": "Images/Gradient_1x256.png",
+    "Convai.HomePage.Dashboard": "Images/HomePage/Dashboard.png",
+    "Convai.HomePage.Configurations": "Images/HomePage/Configurations.png",
+    "Convai.HomePage.Experiences": "Images/HomePage/ConvaiExperiences.png",
+    "Convai.Support.Documentation": "Images/Support/Documentation.png",
+    "Convai.Support.YoutubeTutorials": "Images/Support/YoutubeTutorials.png",
+    "Convai.Support.ConvaiDeveloperForum": "Images/Support/ConvaiDeveloperForum.png",
+    "Convai.Icon.Actions": "Icons/Actions.png",
+    "Convai.Icon.NarrativeDesign": "Icons/NarrativeDesign.png",
+    "Convai.Icon.LongTermMemory": "Icons/LongTermMemory.png",
+    "Convai.Icon.OpenExternally": "Icons/OpenExternally.png",
+    "Convai.Icon.ExternalLink": "Icons/ExternalLink.png",
+    "Convai.Icon.Toggle": "Icons/Toggle.png",
+    "Convai.Icon.SignOut": "Icons/SignOut.png",
+    "Convai.Icon.16": "../Icon128.png",
+    "Convai.Icon.40": "../Icon128.png",
+    "Welcome.WelcomeBanner": "Images/Welcome/WelcomeBanner.png"
+  }
+}

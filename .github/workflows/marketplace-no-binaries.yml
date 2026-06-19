@@ -1,0 +1,96 @@
+name: Marketplace No-Binaries Repackage
+
+# Manual workflow. Takes the per-version precompiled zips from an existing
+# release (latest by default), strips Unreal-generated Binaries/Intermediate
+# and the precompiled "Installed" flag, and republishes them as a separate
+# PRE-RELEASE named "Marketplace - <version>" with a -marketplace-no-binaries
+# suffix. No engine build runs — it only repackages existing release assets.
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Source release tag to repackage (leave blank for the latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  repackage:
+    runs-on: UE-Dev-Runner
+    steps:
+      - name: Repackage release into marketplace no-binaries zips
+        id: repackage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "${{ github.repository }}"
+          $inputTag = "${{ github.event.inputs.source_tag }}"
+          $apiHeaders = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "convai-actions"; Accept = "application/vnd.github+json" }
+
+          if ([string]::IsNullOrWhiteSpace($inputTag)) {
+              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $apiHeaders
+          } else {
+              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$inputTag" -Headers $apiHeaders
+          }
+          $srcTag = $rel.tag_name
+          Write-Host "Source release: $srcTag ($($rel.name))"
+
+          $work = Join-Path $env:RUNNER_TEMP ("mkt_" + [System.Guid]::NewGuid().ToString("N"))
+          $dl = Join-Path $work "dl"
+          $out = Join-Path $work "out"
+          New-Item -ItemType Directory -Force -Path $dl, $out | Out-Null
+
+          # Only the per-version precompiled zips (Convai-UE<ver>.zip); skip any variants.
+          $targets = $rel.assets | Where-Object { $_.name -match '^Convai-UE[0-9]+\.[0-9]+\.zip$' }
+          if (-not $targets) { throw "No Convai-UE<ver>.zip assets found in release $srcTag" }
+
+          foreach ($asset in $targets) {
+              $zipPath = Join-Path $dl $asset.name
+              Write-Host "Downloading $($asset.name)..."
+              Invoke-WebRequest -Uri $asset.url -OutFile $zipPath -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "convai-actions"; Accept = "application/octet-stream" }
+
+              $ver = ($asset.name -replace '^Convai-UE','' -replace '\.zip$','')   # e.g. 5.6
+              $ex = Join-Path $work ("ex_" + $ver)
+              if (Test-Path $ex) { Remove-Item -Recurse -Force $ex }
+              New-Item -ItemType Directory -Force -Path $ex | Out-Null
+              Expand-Archive -Path $zipPath -DestinationPath $ex -Force
+
+              $uplugin = Get-ChildItem -Path $ex -Recurse -Filter *.uplugin | Select-Object -First 1
+              if (-not $uplugin) { Write-Warning "No .uplugin in $($asset.name), skipping"; continue }
+              $plugdir = $uplugin.Directory.FullName
+
+              # Strip Unreal-generated binaries/intermediates.
+              Get-ChildItem -Path $plugdir -Recurse -Directory -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -in @("Binaries","Intermediate","DerivedDataCache") } |
+                  ForEach-Object { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
+
+              # Drop the "Installed" precompiled flag so the marketplace compiles from source.
+              $j = Get-Content $uplugin.FullName -Raw | ConvertFrom-Json
+              if ($j.PSObject.Properties.Name -contains "Installed") { $j.PSObject.Properties.Remove("Installed") }
+              $j | ConvertTo-Json -Depth 50 | Set-Content $uplugin.FullName -Encoding UTF8
+
+              # Re-zip with the plugin folder ("Convai/") at the archive root.
+              $zipOut = Join-Path $out ("Convai-UE" + $ver + "-marketplace-no-binaries.zip")
+              Compress-Archive -Path $plugdir -DestinationPath $zipOut -Force
+              Write-Host "Created $(Split-Path $zipOut -Leaf)"
+          }
+
+          Get-ChildItem $out | Format-Table Name, Length | Out-String | Write-Host
+          $outFwd = $out -replace '\\','/'
+          "out_dir=$outFwd" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "src_tag=$srcTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        shell: pwsh
+
+      - name: Publish marketplace pre-release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: marketplace-${{ steps.repackage.outputs.src_tag }}
+          name: "Marketplace - ${{ steps.repackage.outputs.src_tag }}"
+          prerelease: true
+          body: "Source-only marketplace packages (no Binaries/Intermediate, Installed flag removed), repackaged from release ${{ steps.repackage.outputs.src_tag }}."
+          files: ${{ steps.repackage.outputs.out_dir }}/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

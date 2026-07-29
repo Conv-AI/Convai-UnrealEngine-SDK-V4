@@ -1,0 +1,26 @@
+# Unreal Engine auto-generated / build artifacts
+Intermediate
+Binaries
+Build
+Saved
+DerivedDataCache
+*.gen.cpp
+*.generated.h
+
+# UE non-source assets
+Content
+Config
+
+# Editor UI chrome (icons, gradients, small images)
+Resources/ConvaiEditor/Icons
+Resources/ConvaiEditor/Images
+Resources/Icon128.png
+
+# Graphify's own output
+graphify-out
+
+# Misc
+.vs
+.idea
+__pycache__
+node_modules

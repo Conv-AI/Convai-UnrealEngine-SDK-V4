@@ -1,0 +1,55 @@
+# Unreal Engine .gitignore
+# Note: Adjust this to fit the specifics of your project if necessary
+
+# Ignore all folders in the project root except Source, Resources, Docs, and
+# the explicitly allowlisted plugin config below.
+/*/
+!/.github/
+!/Source/
+!/Resources/
+!/Docs/
+!/Config/
+/Config/*
+!/Config/DefaultConvAI.ini
+# Ignore intermediate build files
+Binaries/
+Intermediate/
+# Source/ThirdParty/
+# Plugin Content stays ignored except for shipped AgentSkills. These assets are
+# product documentation and must change atomically with the APIs they describe.
+!/Content/
+/Content/*
+!/Content/Skills/
+!/Content/Skills/**
+# Ignore all .generated.h files
+*.generated.h
+
+# Ignore asset files (Unreal uses a binary format, which doesn't work well with Git)
+#*.uasset
+Content/Widgets/Fonts/
+*.umap
+
+# Ignore log files
+Saved/Logs/
+
+# Ignore user-specific files
+Saved/Config/Windows/
+Saved/Config/Linux/
+Saved/Config/Mac/
+Saved/StagedBuilds/
+
+# Ignore thirdparty libs
+Source/ThirdParty/ConvaiWebRTC/lib/
+
+# Ignore Visual Studio user-specific files
+*.suo
+*.user
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.VC.db-shm
+*.VC.db-wal
+
+graphify-out/
+CLAUDE.md

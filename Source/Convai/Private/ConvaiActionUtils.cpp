@@ -1,0 +1,1467 @@
+// Copyright 2022 Convai Inc. All Rights Reserved.
+
+
+#include "ConvaiActionUtils.h"
+#include "ConvaiUtils.h"
+#include "Internationalization/Regex.h"
+#include "ConvaiDefinitions.h"
+#include "Environment/ConvaiEnvironment.h"
+
+DEFINE_LOG_CATEGORY(ConvaiActionUtilsLog);
+
+namespace
+{
+	bool FindCharAfterIndex(const FString& SearchString, const char Search, int32& OutIndex, const int32& AfterIndex)
+	{
+		return SearchString.Left(AfterIndex).FindChar(Search, OutIndex);
+	}
+
+	FString RemoveQuotedWords(const FString& Input)
+	{
+
+		int32 QuoteStartIndex = -1;
+		if (!Input.FindChar('"', QuoteStartIndex))
+		{
+			return Input;
+		}
+
+		FString Result = Input;
+
+		while (Result.FindChar('"', QuoteStartIndex))
+		{
+			int32 QuoteEndIndex = -1;
+
+			// Start searching for the end quote after the start quote
+			if (Result.Left(QuoteStartIndex + 1).FindChar('"', QuoteEndIndex) && QuoteEndIndex > QuoteStartIndex)
+			{
+				// Remove the quoted string, including the quotes
+				Result.RemoveAt(QuoteStartIndex, QuoteEndIndex - QuoteStartIndex + 1);
+			}
+			else
+			{
+				// No closing quote found after this point, break the loop
+				break;
+			}
+		}
+
+		return Result;
+	}
+
+	int32 CountWords(const FString& str)
+	{
+		if (str.Len() == 0) return 0;
+
+		TArray<FString> words;
+		str.ParseIntoArray(words, TEXT(" "), true);
+
+		return words.Num();
+	}
+
+	FString KeepNWords(const FString& StringToBeParsed, const FString& CandidateString)
+	{
+		TArray<FString> words;
+		StringToBeParsed.ParseIntoArray(words, TEXT(" "), true);
+
+		int32 N = CountWords(CandidateString);
+
+		FString result;
+		for (int32 i = 0; i < FMath::Min(N, words.Num()); i++)
+		{
+			result += words[i] + " ";
+		}
+
+		// Trim trailing space
+		result = result.LeftChop(1);
+
+		return result;
+	}
+
+	bool HasCanonicalActionBoundary(const FString& FilledIn, const int32 NameLength)
+	{
+		if (FilledIn.Len() == NameLength)
+		{
+			return true;
+		}
+		if (FilledIn.Len() < NameLength)
+		{
+			return false;
+		}
+		const TCHAR NextCharacter = FilledIn[NameLength];
+		return FChar::IsWhitespace(NextCharacter) ||
+			NextCharacter == TEXT('{') ||
+			NextCharacter == TEXT(':') ||
+			NextCharacter == TEXT(',');
+	}
+
+	bool IsOnlyWrapperSuffixPunctuation(const FString& Suffix)
+	{
+		for (const TCHAR Character : Suffix)
+		{
+			if (!FChar::IsWhitespace(Character) &&
+				Character != TEXT('.') &&
+				Character != TEXT(',') &&
+				Character != TEXT(';') &&
+				Character != TEXT('!') &&
+				Character != TEXT('?'))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool TryUnwrapSingleValue(const FString& Value, FString& OutUnwrapped)
+	{
+		if (Value.Len() < 2)
+		{
+			return false;
+		}
+
+		if (Value[0] == TEXT('{'))
+		{
+			const int32 ClosingBrace = Value.Find(
+				TEXT("}"),
+				ESearchCase::CaseSensitive,
+				ESearchDir::FromStart,
+				1);
+			if (ClosingBrace != INDEX_NONE &&
+				IsOnlyWrapperSuffixPunctuation(Value.RightChop(ClosingBrace + 1)))
+			{
+				OutUnwrapped = Value.Mid(1, ClosingBrace - 1);
+				return true;
+			}
+			return false;
+		}
+
+		if (Value[0] == TEXT('"') || Value[0] == TEXT('\''))
+		{
+			const TCHAR QuoteCharacter = Value[0];
+			int32 ClosingQuote = INDEX_NONE;
+			for (int32 Index = 1; Index < Value.Len(); ++Index)
+			{
+				if (Value[Index] != QuoteCharacter)
+				{
+					continue;
+				}
+				if (ClosingQuote != INDEX_NONE)
+				{
+					// More than one closing quote means this is not a single wrapper.
+					return false;
+				}
+				ClosingQuote = Index;
+			}
+
+			if (ClosingQuote != INDEX_NONE &&
+				IsOnlyWrapperSuffixPunctuation(Value.RightChop(ClosingQuote + 1)))
+			{
+				OutUnwrapped = Value.Mid(1, ClosingQuote - 1);
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	struct FCompleteQuotedSpan
+	{
+		int32 Begin = INDEX_NONE;
+		int32 End = INDEX_NONE;
+		FString Value;
+	};
+
+	TArray<FCompleteQuotedSpan> CollectCompleteDoubleQuotedSpans(const FString& Text)
+	{
+		TArray<FCompleteQuotedSpan> Spans;
+		int32 OpeningQuote = INDEX_NONE;
+		for (int32 Index = 0; Index < Text.Len(); ++Index)
+		{
+			if (Text[Index] != TEXT('"'))
+			{
+				continue;
+			}
+
+			if (OpeningQuote == INDEX_NONE)
+			{
+				OpeningQuote = Index;
+				continue;
+			}
+
+			FCompleteQuotedSpan& Span = Spans.Emplace_GetRef();
+			Span.Begin = OpeningQuote;
+			Span.End = Index + 1;
+			Span.Value = Text.Mid(OpeningQuote + 1, Index - OpeningQuote - 1);
+			OpeningQuote = INDEX_NONE;
+		}
+		return Spans;
+	}
+
+	bool TryExtractExclusiveQuotedValues(
+		const FString& Text,
+		const TArray<FConvaiActionParam>& Params,
+		const TArray<FCompleteQuotedSpan>& Spans,
+		TArray<FString>& OutValues)
+	{
+		if (Spans.Num() != Params.Num() || Spans.IsEmpty())
+		{
+			return false;
+		}
+
+		if (!Text.Left(Spans[0].Begin).TrimStartAndEnd().IsEmpty() ||
+			!IsOnlyWrapperSuffixPunctuation(Text.RightChop(Spans.Last().End)))
+		{
+			return false;
+		}
+
+		for (int32 Index = 1; Index < Spans.Num(); ++Index)
+		{
+			const FString Gap = Text.Mid(
+				Spans[Index - 1].End,
+				Spans[Index].Begin - Spans[Index - 1].End).TrimStartAndEnd();
+			if (!Gap.IsEmpty() &&
+				!Gap.Equals(Params[Index].Connector, ESearchCase::IgnoreCase))
+			{
+				return false;
+			}
+		}
+
+		OutValues.Reset(Spans.Num());
+		for (const FCompleteQuotedSpan& Span : Spans)
+		{
+			OutValues.Add(Span.Value);
+		}
+		return true;
+	}
+
+	TArray<int32> FindSeparatorOccurrencesOutsideCompleteQuotes(
+		const FString& Text,
+		const FString& Separator)
+	{
+		TArray<int32> Occurrences;
+		if (Separator.IsEmpty())
+		{
+			return Occurrences;
+		}
+
+		const TArray<FCompleteQuotedSpan> Spans =
+			CollectCompleteDoubleQuotedSpans(Text);
+		int32 SearchFrom = 0;
+		while (SearchFrom <= Text.Len() - Separator.Len())
+		{
+			const int32 FoundAt = Text.Find(
+				Separator,
+				ESearchCase::IgnoreCase,
+				ESearchDir::FromStart,
+				SearchFrom);
+			if (FoundAt == INDEX_NONE)
+			{
+				break;
+			}
+
+			const int32 MatchEnd = FoundAt + Separator.Len();
+			const bool bInsideCompleteQuote = Spans.ContainsByPredicate(
+				[FoundAt, MatchEnd](const FCompleteQuotedSpan& Span)
+				{
+					return FoundAt < Span.End && MatchEnd > Span.Begin;
+				});
+			if (!bInsideCompleteQuote)
+			{
+				Occurrences.Add(FoundAt);
+			}
+			SearchFrom = MatchEnd;
+		}
+		return Occurrences;
+	}
+
+	bool IsConnectorToken(const FString& Token, const FString& Connector)
+	{
+		return !Connector.IsEmpty() &&
+			Token.Len() >= Connector.Len() &&
+			Token.Left(Connector.Len()).Equals(Connector, ESearchCase::IgnoreCase) &&
+			IsOnlyWrapperSuffixPunctuation(Token.RightChop(Connector.Len()));
+	}
+
+	int32 FindNamedParameterAnchor(const FString& Text, const FString& ParameterName)
+	{
+		if (ParameterName.IsEmpty())
+		{
+			return INDEX_NONE;
+		}
+
+		const FString Needle = ParameterName + TEXT(":");
+		int32 Index = Text.Find(Needle, ESearchCase::IgnoreCase);
+		while (Index != INDEX_NONE)
+		{
+			if (Index == 0 || !FChar::IsAlnum(Text[Index - 1]))
+			{
+				return Index;
+			}
+			Index = Text.Find(
+				Needle,
+				ESearchCase::IgnoreCase,
+				ESearchDir::FromStart,
+				Index + 1);
+		}
+		return INDEX_NONE;
+	}
+
+	FString FindClosestString(FString Input, const TArray<FString>& StringArray)
+	{
+		FString ClosestString;
+		int32 MinDistance = MAX_int32;
+
+		for (auto& String : StringArray)
+		{
+			int32 Distance = UConvaiUtils::LevenshteinDistance(Input, String);
+			if (Distance < MinDistance)
+			{
+				MinDistance = Distance;
+				ClosestString = String;
+			}
+		}
+
+		return ClosestString;
+	}
+
+	bool FindClosePhraseOutsideQuotes(const FString& SearchString, const FString& PhraseToFind, int& OutBestDistance, int NumWordsToSkip = 0)
+	{
+		if (PhraseToFind.IsEmpty())
+		{
+			return false; // Can't find an empty phrase.
+		}
+
+		int32 MaxLevenshteinDistance = FMath::Clamp(PhraseToFind.Len() / 2, 2, 4);
+		TArray<FString> Words;
+		FString CurrentWord;
+		bool bInsideQuotes = false;
+		OutBestDistance = MaxLevenshteinDistance + 1; // Initialize with a value above the limit
+
+		// Collect words outside quotes
+		for (TCHAR Char : SearchString)
+		{
+			if (Char == '"')
+			{
+				bInsideQuotes = !bInsideQuotes;
+				if (!CurrentWord.IsEmpty())
+				{
+					Words.Add(CurrentWord);
+					CurrentWord.Empty();
+				}
+				continue;
+			}
+
+			if (!bInsideQuotes && (Char == ' ' || Char == '\t'))
+			{
+				if (!CurrentWord.IsEmpty())
+				{
+					Words.Add(CurrentWord);
+					CurrentWord.Empty();
+				}
+			}
+			else if (!bInsideQuotes)
+			{
+				CurrentWord.AppendChar(Char);
+			}
+		}
+
+		// Add the last word if there is one
+		if (!CurrentWord.IsEmpty())
+		{
+			Words.Add(CurrentWord);
+		}
+
+		// Number of words in the phrase to find
+		TArray<FString> PhraseWords;
+		PhraseToFind.ParseIntoArray(PhraseWords, TEXT(" "), true);
+		int32 NumWordsInPhrase = PhraseWords.Num();
+
+		// Sliding window of words to check for the phrase
+		for (int32 i = NumWordsToSkip; i <= Words.Num() - NumWordsInPhrase; ++i)
+		{
+			FString WindowString;
+			for (int32 j = 0; j < NumWordsInPhrase; ++j)
+			{
+				WindowString += (j > 0 ? TEXT(" ") : TEXT("")) + Words[i + j];
+			}
+
+			if (WindowString.Len() - PhraseToFind.Len() >= MaxLevenshteinDistance || PhraseToFind.Len() - WindowString.Len() >= MaxLevenshteinDistance)
+			{
+				continue;
+			}
+
+			int32 Distance = UConvaiUtils::LevenshteinDistance(WindowString, PhraseToFind);
+			if (Distance <= MaxLevenshteinDistance && Distance < OutBestDistance)
+			{
+				OutBestDistance = Distance;
+			}
+		}
+
+		// The function returns true if we found a match within the acceptable Levenshtein distance
+		return OutBestDistance <= MaxLevenshteinDistance;
+	}
+
+	static bool FindNearestObjectByName(FString SearchString, TArray<FConvaiObjectEntry> Objects, FConvaiObjectEntry& ObjectMatch)
+	{
+		FString SearchStringLower = SearchString.ToLower();
+		bool Found = false;
+		int BestDistance = 100;
+		for (auto o : Objects)
+		{
+			FString ObjectNameLower = o.Name.ToLower();
+			int Distance = 0;
+			if (FindClosePhraseOutsideQuotes(SearchStringLower, ObjectNameLower, Distance))
+			{
+				if (Distance < BestDistance)
+				{
+					ObjectMatch = o;
+					BestDistance = Distance;
+					Found = true;
+				}
+			}
+		}
+
+		// Try to search in objects using each word in the SearchString
+		if (!Found)
+		{
+			TArray<FString> words;
+			FString SearchStringWithoutQuotes = RemoveQuotedWords(SearchStringLower);
+			SearchStringWithoutQuotes.ParseIntoArray(words, TEXT(" "), true);
+			bool breakFromLoop = false;
+			for (auto o : Objects)
+			{
+				if (breakFromLoop)
+					break;
+				if (CountWords(o.Name) <= 1)
+					continue; // consider only names consisting of 1+ words
+
+				FString ObjectNameLower = o.Name.ToLower();
+				for (auto w : words)
+				{
+					if (w.Len() <= 3)
+						continue; // consider only words greater than 3 letters
+
+					int Distance = 0;
+					if (FindClosePhraseOutsideQuotes(ObjectNameLower, w, Distance))
+					{
+						ObjectMatch = o;
+						BestDistance = Distance;
+						Found = true;
+						breakFromLoop = true;
+						break;
+					}
+				}
+			}
+		}
+
+		return Found;
+	}
+
+	TArray<FConvaiObjectEntry> BubbleSortEntriesByNumberOfWords(TArray<FConvaiObjectEntry> Entries) 
+	{
+		bool swapped;
+		int n = Entries.Num();
+		for (int i = 0; i < n - 1; i++) {
+			swapped = false;
+			for (int j = 0; j < n - i - 1; j++) {
+				if (CountWords(Entries[j].Name) > CountWords(Entries[j+1].Name)) {
+					Entries.Swap(j, j + 1);
+					swapped = true;
+				}
+			}
+			// If no two elements were swapped by inner loop, then break
+			if (!swapped) {
+				break;
+			}
+		}
+		return Entries;
+	}
+};
+
+TArray<FString> UConvaiActions::SmartSplit(const FString& SequenceString)
+{
+	TArray<FString> Result;
+	FString CurrentString = "";
+	bool InQuotes = false;
+
+	for (int i = 0; i < SequenceString.Len(); ++i)
+	{
+		TCHAR CurrentChar = SequenceString[i];
+
+		if (CurrentChar == '\"')
+		{
+			InQuotes = !InQuotes;
+		}
+
+		if (CurrentChar == ',' && !InQuotes)
+		{
+			Result.Add(CurrentString.TrimStartAndEnd());
+			CurrentString = "";
+		}
+		else
+		{
+			CurrentString += CurrentChar;
+		}
+	}
+
+	if (!CurrentString.IsEmpty())
+	{
+		Result.Add(CurrentString.TrimStartAndEnd());
+	}
+
+	return Result;
+}
+
+FString UConvaiActions::ExtractText(const FString& ActionResult)
+{
+	// Match a double-quoted substring first ("..."), fall back to single-quoted ('...').
+	// Strip the surrounding quote chars (LeftChop+RightChop trim 1 char from each end).
+	{
+		const FRegexPattern DoublePattern(TEXT("\"[^\"]*\""));
+		FRegexMatcher Matcher(DoublePattern, ActionResult);
+		if (Matcher.FindNext())
+		{
+			return Matcher.GetCaptureGroup(0).LeftChop(1).RightChop(1);
+		}
+	}
+	{
+		const FRegexPattern SinglePattern(TEXT("'[^']*'"));
+		FRegexMatcher Matcher(SinglePattern, ActionResult);
+		if (Matcher.FindNext())
+		{
+			return Matcher.GetCaptureGroup(0).LeftChop(1).RightChop(1);
+		}
+	}
+	return FString();
+}
+
+float UConvaiActions::ExtractNumber(const FString& ActionResult)
+{
+	float ExtraNumber = 0;
+	const FRegexPattern NumericPattern(TEXT("\\d+"));
+	FRegexMatcher NumberMatcher(NumericPattern, ActionResult);
+	if (NumberMatcher.FindNext())
+	{
+		ExtraNumber = FCString::Atof(*NumberMatcher.GetCaptureGroup(0));
+	}
+	return ExtraNumber;
+}
+
+FString UConvaiActions::RemoveDesc(FString str)
+{
+	FRegexPattern DescPattern(TEXT("<.*>"));
+	FRegexMatcher DescMatcher = FRegexMatcher(DescPattern, str);
+	int i = 0;
+	while (DescMatcher.FindNext())
+	{
+		int start = DescMatcher.GetMatchBeginning();
+		str.ReplaceInline(*DescMatcher.GetCaptureGroup(i++), *FString(""));
+		str.TrimEndInline();
+		str.TrimStartInline();
+	}
+	//CONVAI_LOG(ConvaiActionUtilsLog, Warning, TEXT("str:%s"), *str);
+	return str;
+}
+
+FString UConvaiActions::FindAction(FString ActionToBeParsed, TArray<FString> Actions)
+{
+	FString ClosestAction = "None";
+	int32 MinDistance = 4;
+	for (auto a : Actions)
+	{
+		FString TrimmedAction = ActionToBeParsed;
+		a = RemoveDesc(a);
+		TrimmedAction = KeepNWords(ActionToBeParsed, a);
+		int32 Distance = UConvaiUtils::LevenshteinDistance(TrimmedAction, a);
+		if (Distance < MinDistance)
+		{
+			MinDistance = Distance;
+			ClosestAction = a;
+		}
+	}
+	return ClosestAction;
+}
+
+const FConvaiAction* UConvaiActions::FindActionTemplate(const FString& FilledIn, const TArray<FConvaiAction>& Templates)
+{
+	const FString TrimmedFilledIn = FilledIn.TrimStartAndEnd();
+
+	// Prefer an exact canonical prefix at a real action/value boundary. Some realtime
+	// responses use the legacy inline shape `Name{Param:Value}`; a whitespace-only
+	// word window treats the entire string as the action name. Longest match wins so
+	// `Move To Exact` is not shadowed by `Move To`.
+	const FConvaiAction* LongestExactPrefix = nullptr;
+	int32 LongestExactPrefixLength = INDEX_NONE;
+	for (const FConvaiAction& T : Templates)
+	{
+		if (T.Name.IsEmpty() || T.Name.Len() > TrimmedFilledIn.Len())
+		{
+			continue;
+		}
+		if (TrimmedFilledIn.Left(T.Name.Len()).Equals(T.Name, ESearchCase::IgnoreCase)
+			&& HasCanonicalActionBoundary(TrimmedFilledIn, T.Name.Len())
+			&& T.Name.Len() > LongestExactPrefixLength)
+		{
+			LongestExactPrefix = &T;
+			LongestExactPrefixLength = T.Name.Len();
+		}
+	}
+	if (LongestExactPrefix != nullptr)
+	{
+		return LongestExactPrefix;
+	}
+
+	// Backward-compatible fuzzy fallback for imperfect model spelling.
+	const FConvaiAction* Best = nullptr;
+	int32 MinDistance = 4;
+	for (const FConvaiAction& T : Templates)
+	{
+		if (T.Name.IsEmpty())
+		{
+			continue;
+		}
+		const FString Window = KeepNWords(TrimmedFilledIn, T.Name);
+		const int32 Distance = UConvaiUtils::LevenshteinDistance(Window, T.Name);
+		if (Distance < MinDistance)
+		{
+			MinDistance = Distance;
+			Best = &T;
+		}
+	}
+	return Best;
+}
+
+FString UConvaiActions::StripActionPrefix(const FString& FilledIn, const FString& CanonicalName)
+{
+	if (CanonicalName.IsEmpty())
+	{
+		return FilledIn;
+	}
+	const FString Trimmed = FilledIn.TrimStartAndEnd();
+	if (Trimmed.Len() < CanonicalName.Len() ||
+		!Trimmed.Left(CanonicalName.Len()).Equals(CanonicalName, ESearchCase::IgnoreCase) ||
+		!HasCanonicalActionBoundary(Trimmed, CanonicalName.Len()))
+	{
+		return Trimmed;
+	}
+
+	FString Remainder = Trimmed.RightChop(CanonicalName.Len());
+	// A weak model may glue a conventional separator to the action name
+	// (`Follow: User`, `Follow, User`). Only consume it when it is the actual
+	// boundary character so punctuation authored at the start of a free-text
+	// value remains intact.
+	if (!Remainder.IsEmpty() &&
+		(Remainder[0] == TEXT(':') || Remainder[0] == TEXT(',')))
+	{
+		Remainder.RightChopInline(1);
+	}
+	return Remainder.TrimStartAndEnd();
+}
+
+TArray<FString> UConvaiActions::SplitParamValues(const FString& Blob, int32 ExpectedCount)
+{
+	TArray<FString> Out;
+	const FString Trimmed = Blob.TrimStartAndEnd();
+	if (Trimmed.IsEmpty() || ExpectedCount <= 0)
+	{
+		return Out;
+	}
+
+	// A single placeholder owns the entire response. Only unwrap braces/quotes when they
+	// enclose the whole blob; embedded punctuation is part of the value (for example
+	// `Marcus "Aurelius" Panel` or `Gallery {North}`).
+	if (ExpectedCount == 1)
+	{
+		FString Unwrapped;
+		if (TryUnwrapSingleValue(Trimmed, Unwrapped))
+		{
+			Out.Add(MoveTemp(Unwrapped));
+		}
+		else
+		{
+			Out.Add(Trimmed);
+		}
+		return Out;
+	}
+
+	// Brace-aware first: the prompt now teaches the LLM to wrap values as {v1} {v2} ...
+	// When at least one brace segment exists, treat that set as authoritative.
+	{
+		const FRegexPattern Pattern(TEXT("\\{([^}]*)\\}"));
+		FRegexMatcher Matcher(Pattern, Trimmed);
+		while (Matcher.FindNext())
+		{
+			Out.Add(Matcher.GetCaptureGroup(1));
+		}
+		if (Out.Num() > 0)
+		{
+			return Out;
+		}
+	}
+
+	// Quote-aware fallback: legacy / fine-tuned models may still emit "v1" "v2" ...
+	{
+		const FRegexPattern Pattern(TEXT("\"([^\"]*)\""));
+		FRegexMatcher Matcher(Pattern, Trimmed);
+		while (Matcher.FindNext())
+		{
+			Out.Add(Matcher.GetCaptureGroup(1));
+		}
+		if (Out.Num() > 0)
+		{
+			return Out;
+		}
+	}
+
+	// Multi-slot: split into N tokens, last one absorbs trailing tokens.
+	TArray<FString> Tokens;
+	Trimmed.ParseIntoArrayWS(Tokens);
+	if (Tokens.Num() <= ExpectedCount)
+	{
+		return Tokens;
+	}
+	for (int32 i = 0; i < ExpectedCount - 1; ++i)
+	{
+		Out.Add(Tokens[i]);
+	}
+	FString Tail;
+	for (int32 i = ExpectedCount - 1; i < Tokens.Num(); ++i)
+	{
+		if (!Tail.IsEmpty()) Tail += TEXT(" ");
+		Tail += Tokens[i];
+	}
+	Out.Add(Tail);
+	return Out;
+}
+
+TArray<FString> UConvaiActions::SplitParamValues(const FString& Blob, const TArray<FConvaiActionParam>& Params)
+{
+	const int32 N = Params.Num();
+	TArray<FString> Out;
+	const FString Trimmed = Blob.TrimStartAndEnd();
+	if (Trimmed.IsEmpty() || N == 0)
+	{
+		Out.SetNum(N);
+		return Out;
+	}
+	if (N == 1)
+	{
+		Out = SplitParamValues(Trimmed, 1);
+		Out.SetNum(1);
+		return Out;
+	}
+
+	FString NamedKeyBlob = Trimmed;
+
+	// Pass 1: brace-wrapped {v1} {v2}.
+	{
+		const FRegexPattern Pattern(TEXT("\\{([^}]*)\\}"));
+		FRegexMatcher Matcher(Pattern, Trimmed);
+		while (Matcher.FindNext())
+		{
+			Out.Add(Matcher.GetCaptureGroup(1));
+		}
+		if (Out.Num() > 0)
+		{
+			// A weak model may wrap a whole named response once instead of wrapping
+			// each value: `{character:User, destination:Gallery}`. Only reinterpret
+			// that single segment when at least two declared names are present;
+			// otherwise preserve the established positional-brace behavior.
+			int32 NamedAnchorCount = 0;
+			if (Out.Num() == 1)
+			{
+				for (const FConvaiActionParam& Param : Params)
+				{
+					if (FindNamedParameterAnchor(Out[0], Param.Name) != INDEX_NONE)
+					{
+						++NamedAnchorCount;
+					}
+				}
+			}
+
+			if (NamedAnchorCount >= 2)
+			{
+				NamedKeyBlob = Out[0].TrimStartAndEnd();
+				Out.Reset();
+			}
+			else
+			{
+				Out.SetNum(N);
+				return Out;
+			}
+		}
+	}
+
+	// Pass 2: named-key — find each "<paramName>:" as an anchor and carve out the value
+	// up to the next anchor (or end of blob). Word-boundary check on the left so
+	// "name:" doesn't match inside "surname:".
+	{
+		struct FAnchor { int32 NameIdx; int32 StartIdx; int32 ValueIdx; };
+		TArray<FAnchor> Anchors;
+		for (int32 i = 0; i < N; ++i)
+		{
+			const FString& PName = Params[i].Name;
+			if (PName.IsEmpty()) continue;
+			const FString Needle = PName + TEXT(":");
+			const int32 Idx = FindNamedParameterAnchor(NamedKeyBlob, PName);
+			if (Idx == INDEX_NONE) continue;
+			Anchors.Add({ i, Idx, Idx + Needle.Len() });
+		}
+
+		if (Anchors.Num() > 0)
+		{
+			Anchors.Sort([](const FAnchor& A, const FAnchor& B) { return A.StartIdx < B.StartIdx; });
+
+			Out.SetNum(N);
+			for (int32 a = 0; a < Anchors.Num(); ++a)
+			{
+				const int32 ValStart = Anchors[a].ValueIdx;
+				const int32 ValEnd = (a + 1 < Anchors.Num())
+					? Anchors[a + 1].StartIdx
+					: NamedKeyBlob.Len();
+				FString Value = NamedKeyBlob.Mid(ValStart, ValEnd - ValStart).TrimStartAndEnd();
+
+				// Trim a trailing connector (next param's Connector) or a common conjunction.
+				if (a + 1 < Anchors.Num())
+				{
+					const int32 NextNameIdx = Anchors[a + 1].NameIdx;
+					const FString& NextConn = Params[NextNameIdx].Connector;
+					bool bStripped = false;
+					if (!NextConn.IsEmpty())
+					{
+						const FString Suffix = TEXT(" ") + NextConn;
+						if (Value.EndsWith(Suffix, ESearchCase::IgnoreCase))
+						{
+							Value = Value.LeftChop(Suffix.Len()).TrimEnd();
+							bStripped = true;
+						}
+					}
+					if (!bStripped)
+					{
+						static const TArray<FString> Fillers = { TEXT(" and"), TEXT(" or"), TEXT(",") };
+						for (const FString& F : Fillers)
+						{
+							if (Value.EndsWith(F, ESearchCase::IgnoreCase))
+							{
+								Value = Value.LeftChop(F.Len()).TrimEnd();
+								break;
+							}
+						}
+					}
+				}
+				Out[Anchors[a].NameIdx] = Value;
+			}
+			return Out;
+		}
+	}
+
+	// Pass 3: connector-as-separator — when every inter-param Connector is set, use them
+	// to carve the blob (e.g. template `Put {ball} on {table}` → response `ball on table`).
+	bool bHasConnectorContract = false;
+	if (N >= 2)
+	{
+		bool bAllConnectorsSet = true;
+		for (int32 i = 1; i < N; ++i)
+		{
+			if (Params[i].Connector.IsEmpty()) { bAllConnectorsSet = false; break; }
+		}
+		if (bAllConnectorsSet)
+		{
+			bHasConnectorContract = true;
+
+			// Quoted values are authoritative only when they form the complete
+			// positional response. Quoted phrases inside free text are content,
+			// not extra parameter slots.
+			const TArray<FCompleteQuotedSpan> CompleteQuotedSpans =
+				CollectCompleteDoubleQuotedSpans(Trimmed);
+			TArray<FString> QuotedValues;
+			if (TryExtractExclusiveQuotedValues(
+				Trimmed, Params, CompleteQuotedSpans, QuotedValues))
+			{
+				return QuotedValues;
+			}
+
+			TArray<FString> Carved;
+			Carved.Reserve(N);
+			FString Remaining = Trimmed;
+			bool bAllFound = true;
+			for (int32 i = 1; i < N; ++i)
+			{
+				const FString Sep = TEXT(" ") + Params[i].Connector + TEXT(" ");
+				const TArray<int32> SeparatorOccurrences =
+					FindSeparatorOccurrencesOutsideCompleteQuotes(Remaining, Sep);
+				if (SeparatorOccurrences.IsEmpty()) { bAllFound = false; break; }
+				const int32 Idx = SeparatorOccurrences[0];
+
+				// With an unrestricted String before the connector, repeated
+				// occurrences are genuinely ambiguous. Do not silently turn
+				// `Go to Gallery to User` into `Go` + `Gallery to User`; callers
+				// can use named or quoted values to state the boundary explicitly.
+				const FConvaiActionParam& PreviousParam = Params[i - 1];
+				if (PreviousParam.Type == EConvaiActionParamType::String &&
+					PreviousParam.Choices.IsEmpty())
+				{
+					int32 RequiredOccurrences = 0;
+					for (int32 ConnectorIndex = i; ConnectorIndex < N; ++ConnectorIndex)
+					{
+						if (Params[ConnectorIndex].Connector.Equals(
+							Params[i].Connector, ESearchCase::IgnoreCase))
+						{
+							++RequiredOccurrences;
+						}
+					}
+
+					if (SeparatorOccurrences.Num() > RequiredOccurrences)
+					{
+						bAllFound = false;
+						break;
+					}
+				}
+
+				Carved.Add(Remaining.Left(Idx).TrimStartAndEnd());
+				Remaining = Remaining.RightChop(Idx + Sep.Len());
+			}
+			if (bAllFound)
+			{
+				Carved.Add(Remaining.TrimStartAndEnd());
+				Carved.SetNum(N);
+				return Carved;
+			}
+		}
+	}
+
+	if (bHasConnectorContract)
+	{
+		// Preserve the old simple positional fallback only when there is exactly
+		// one bare token per slot. A longer unquoted blob without its connector
+		// is ambiguous (`Museum Guide Main Gallery`) and must not be guessed as
+		// `Museum` + `Guide Main Gallery`.
+		TArray<FString> BareTokens;
+		Trimmed.ParseIntoArrayWS(BareTokens);
+		const TArray<FCompleteQuotedSpan> FallbackQuotedSpans =
+			CollectCompleteDoubleQuotedSpans(Trimmed);
+		const bool bIsOneWholeQuotedValue =
+			FallbackQuotedSpans.Num() == 1 &&
+			Trimmed.Left(FallbackQuotedSpans[0].Begin).TrimStartAndEnd().IsEmpty() &&
+			IsOnlyWrapperSuffixPunctuation(
+				Trimmed.RightChop(FallbackQuotedSpans[0].End));
+		bool bLooksLikeMissingConnectorValue = false;
+		for (const FString& Token : BareTokens)
+		{
+			for (int32 Index = 1; Index < N; ++Index)
+			{
+				if (IsConnectorToken(Token, Params[Index].Connector))
+				{
+					bLooksLikeMissingConnectorValue = true;
+					break;
+				}
+			}
+			if (bLooksLikeMissingConnectorValue) { break; }
+		}
+		if (BareTokens.Num() == N &&
+			!bIsOneWholeQuotedValue &&
+			!bLooksLikeMissingConnectorValue)
+		{
+			return BareTokens;
+		}
+
+		Out.SetNum(N);
+		return Out;
+	}
+
+	// Pass 4 + 5: delegate to positional splitter (quotes, then whitespace).
+	Out = SplitParamValues(Trimmed, N);
+	Out.SetNum(N);
+	return Out;
+}
+
+FString UConvaiActions::StripParamNameMimicry(const FString& Value, const FString& ParamName,
+	const FConvaiEnvironmentData* Env)
+{
+	FString Working = Value.TrimStartAndEnd();
+	if (Working.IsEmpty())
+	{
+		return Working;
+	}
+
+	// A registered name is data, even when it happens to begin with a token used by the
+	// action schema (for example `target: East Hall` or `ref: Collection`). Prefer that
+	// exact identity over the prompt-mimicry heuristics below.
+	if (Env != nullptr && (Env->FindObject(Working) != nullptr || Env->FindCharacter(Working) != nullptr))
+	{
+		return Working;
+	}
+
+	// Consume only recognized leading labels. Splitting and rejoining every colon used
+	// to rewrite `Artwork: Marcus Panel` as `Artwork:Marcus Panel`, which then failed exact
+	// reference lookup. Once the leading token is real data, preserve the remainder exactly.
+	if (!Working.Contains(TEXT(":")))
+	{
+		return Working;
+	}
+
+	static const TSet<FString> TypeWords = {
+		TEXT("ref"), TEXT("string"), TEXT("number"), TEXT("bool"), TEXT("enum")
+	};
+
+	FString Result = Working;
+	while (true)
+	{
+		int32 ColonIndex = INDEX_NONE;
+		if (!Result.FindChar(TEXT(':'), ColonIndex))
+		{
+			break;
+		}
+
+		const FString LeadingToken = Result.Left(ColonIndex).TrimStartAndEnd();
+		FString NormalizedLeadingToken = LeadingToken;
+		// The LLM may echo a schema label such as `mood [happy|sad]:`.
+		// Remove choices only from the candidate label, never from the value.
+		const FRegexPattern ChoicePattern(TEXT("\\[[^\\]]*\\]"));
+		FRegexMatcher ChoiceMatcher(ChoicePattern, NormalizedLeadingToken);
+		while (ChoiceMatcher.FindNext())
+		{
+			NormalizedLeadingToken =
+				(NormalizedLeadingToken.Left(ChoiceMatcher.GetMatchBeginning())
+					+ NormalizedLeadingToken.RightChop(ChoiceMatcher.GetMatchEnding()))
+				.TrimStartAndEnd();
+			ChoiceMatcher = FRegexMatcher(ChoicePattern, NormalizedLeadingToken);
+		}
+
+		const bool bIsParamLabel = !ParamName.IsEmpty()
+			&& NormalizedLeadingToken.Equals(ParamName, ESearchCase::IgnoreCase);
+		const bool bIsTypeLabel = TypeWords.Contains(NormalizedLeadingToken.ToLower());
+		if (!bIsParamLabel && !bIsTypeLabel)
+		{
+			break;
+		}
+
+		const FString Remainder = Result.RightChop(ColonIndex + 1).TrimStartAndEnd();
+		if (Remainder.IsEmpty())
+		{
+			// Fail closed: never turn a non-empty model value into an empty parameter.
+			return Working;
+		}
+		Result = Remainder;
+	}
+
+	// 3. Leading-prefix-word strip — the LLM sometimes abbreviates the param name as
+	//    a label inside the value (e.g. password → "pass"): "pass kk 111 kkkk".
+	//    Conservative heuristic to avoid false positives: only fires when ParamName
+	//    is >=6 chars (so short names like "name"/"id" are exempt), the first word
+	//    is >=3 chars, and that word is a case-insensitive prefix of ParamName.
+	if (!ParamName.IsEmpty() && ParamName.Len() >= 6)
+	{
+		int32 SpaceIdx = INDEX_NONE;
+		if (Result.FindChar(TEXT(' '), SpaceIdx) && SpaceIdx >= 3)
+		{
+			const FString FirstWord = Result.Left(SpaceIdx);
+			if (ParamName.Len() >= FirstWord.Len() &&
+				ParamName.Left(FirstWord.Len()).Equals(FirstWord, ESearchCase::IgnoreCase))
+			{
+				Result = Result.RightChop(SpaceIdx + 1).TrimStart();
+			}
+		}
+	}
+	return Result;
+}
+
+namespace
+{
+	bool ParseBoolish(const FString& Value, bool& OutMatched)
+	{
+		const FString L = Value.TrimStartAndEnd().ToLower();
+		if (L == TEXT("true") || L == TEXT("yes") || L == TEXT("1"))
+		{
+			OutMatched = true; return true;
+		}
+		if (L == TEXT("false") || L == TEXT("no") || L == TEXT("0"))
+		{
+			OutMatched = true; return false;
+		}
+		OutMatched = false; return false;
+	}
+
+	bool ValueLooksFullyNumeric(const FString& Value)
+	{
+		const FString T = Value.TrimStartAndEnd();
+		if (T.IsEmpty()) return false;
+		bool bSeenDigit = false;
+		bool bSeenDot   = false;
+		for (int32 i = 0; i < T.Len(); ++i)
+		{
+			const TCHAR C = T[i];
+			if (i == 0 && (C == TEXT('-') || C == TEXT('+'))) { continue; }
+			if (FChar::IsDigit(C)) { bSeenDigit = true; continue; }
+			if (C == TEXT('.') && !bSeenDot) { bSeenDot = true; continue; }
+			return false;
+		}
+		return bSeenDigit;
+	}
+}
+
+TArray<FString> UConvaiActions::GetEnumLabels(const UEnum* EnumType)
+{
+	// Must stay in lockstep with what the prompt actually exposes to the LLM —
+	// otherwise we'd accept values for enum entries the LLM was never told about.
+	TArray<FString> Labels;
+	if (!EnumType)
+	{
+		return Labels;
+	}
+	const int32 Max = EnumType->NumEnums();
+	Labels.Reserve(Max);
+	for (int32 i = 0; i < Max; ++i)
+	{
+		// Skip the auto-generated _MAX sentinel UE adds at the end. Conditional on
+		// ContainsExistingMax() because enums without UENUM-style _MAX (e.g. raw enums
+		// that flow through here) shouldn't lose their last legitimate value.
+		if (i == Max - 1 && EnumType->ContainsExistingMax())
+		{
+			continue;
+		}
+#if WITH_EDITORONLY_DATA
+		// UEnum::HasMetaData is editor-only (gated by WITH_EDITORONLY_DATA on 5.0-5.4
+		// and WITH_METADATA on 5.5+, both of which compile out in cooked/runtime builds).
+		if (EnumType->HasMetaData(TEXT("Hidden"), i))
+		{
+			continue;
+		}
+#endif
+		FString Label = EnumType->GetDisplayNameTextByIndex(i).ToString();
+		if (Label.IsEmpty()) { Label = EnumType->GetNameStringByIndex(i); }
+		Labels.Add(MoveTemp(Label));
+	}
+	return Labels;
+}
+
+int32 UConvaiActions::FuzzyFindLabel(const FString& Query, const TArray<FString>& Labels, int32& OutDistance)
+{
+	OutDistance = 0;
+	if (Query.IsEmpty() || Labels.Num() == 0)
+	{
+		return INDEX_NONE;
+	}
+
+	for (int32 i = 0; i < Labels.Num(); ++i)
+	{
+		if (Labels[i].Equals(Query, ESearchCase::IgnoreCase))
+		{
+			return i;
+		}
+	}
+
+	// Fuzzy: LLMs sometimes return paraphrased or mis-cased labels
+	// (e.g. "rotating clockwise" vs "RotatingClockwise"). Accept the closest
+	// candidate within a length-relative Levenshtein bound.
+	const FString QueryLower = Query.ToLower();
+	// LevenshteinDistance uses substitution cost 2 (see ConvaiUtils.cpp), so
+	// MaxDistance>=2 already allows one substitution. For very short queries
+	// (<4 chars) that means a quarter of the string can change and still
+	// match — produces false positives like "Go"->"Do"/"To"/"No". Require
+	// exact match for those.
+	const int32 MaxDistance = QueryLower.Len() < 4 ? 0 : FMath::Clamp(QueryLower.Len() / 2, 2, 4);
+	int32 BestIndex = INDEX_NONE;
+	int32 BestDistance = MaxDistance + 1;
+	for (int32 i = 0; i < Labels.Num(); ++i)
+	{
+		const int32 D = UConvaiUtils::LevenshteinDistance(QueryLower, Labels[i].ToLower());
+		if (D < BestDistance)
+		{
+			BestDistance = D;
+			BestIndex = i;
+		}
+	}
+	if (BestIndex != INDEX_NONE && BestDistance <= MaxDistance)
+	{
+		OutDistance = BestDistance;
+		return BestIndex;
+	}
+
+	// Substring fallback: LLMs sometimes glue extra tokens onto a valid choice
+	// ("wave:User", "nod:\"appreciative\"") which pushes Levenshtein past MaxDistance
+	// even though the intended label is right there. Accept a label that appears as a
+	// whole word inside Query. Word-boundary discipline (no raw Contains) does the
+	// real safety work — verb conjugations like "nodding"/"nodded" and embedded
+	// occurrences like "anode"/"goodbye" all fail the boundary check. MinLen 3 still
+	// keeps two-letter bigrams like "no"/"up"/"on" out, where the bigram coincides
+	// with too many common English words to trust even with boundaries.
+	// Tie-break: longest label, then earliest position, then first-declared.
+	constexpr int32 MinSubstringLen = 3;
+	auto IsWordChar = [](TCHAR C) { return FChar::IsAlnum(C) || FChar::IsUnderscore(C); };
+
+	int32 SubBestIndex = INDEX_NONE;
+	int32 SubBestLen   = -1;
+	int32 SubBestPos   = MAX_int32;
+	for (int32 i = 0; i < Labels.Num(); ++i)
+	{
+		const FString& Label = Labels[i];
+		if (Label.Len() < MinSubstringLen) { continue; }
+		const FString LabelLower = Label.ToLower();
+
+		int32 SearchFrom = 0;
+		while (SearchFrom + LabelLower.Len() <= QueryLower.Len())
+		{
+			const int32 Pos = QueryLower.Find(LabelLower, ESearchCase::CaseSensitive,
+											   ESearchDir::FromStart, SearchFrom);
+			if (Pos == INDEX_NONE) { break; }
+
+			const bool bLeftOk  = (Pos == 0) || !IsWordChar(QueryLower[Pos - 1]);
+			const int32 RightAt = Pos + LabelLower.Len();
+			const bool bRightOk = (RightAt >= QueryLower.Len()) || !IsWordChar(QueryLower[RightAt]);
+
+			if (bLeftOk && bRightOk)
+			{
+				const bool bBetter =
+					Label.Len() > SubBestLen ||
+					(Label.Len() == SubBestLen && Pos < SubBestPos);
+				if (bBetter)
+				{
+					SubBestIndex = i;
+					SubBestLen   = Label.Len();
+					SubBestPos   = Pos;
+				}
+				break; // first whole-word hit per label is enough
+			}
+			SearchFrom = Pos + 1;
+		}
+	}
+
+	if (SubBestIndex != INDEX_NONE)
+	{
+		OutDistance = 0;
+		return SubBestIndex;
+	}
+	return INDEX_NONE;
+}
+
+FConvaiResultParam UConvaiActions::CoerceParam(const FString& Value,
+	EConvaiActionParamType DeclaredType, const FConvaiEnvironmentData& Env,
+	const UEnum* EnumType, const TArray<FString>* Choices, bool* bOutConstraintMatched)
+{
+	FConvaiResultParam P;
+	if (bOutConstraintMatched) { *bOutConstraintMatched = true; }
+
+	// Strip one balanced quote wrapper so the user-visible string isn't noisy.
+	// Do not mangle free text that happens to begin and end with separate quoted
+	// phrases (for example `"Option A" or "Option B"`).
+	FString Clean = Value.TrimStartAndEnd();
+	if (!Clean.IsEmpty() &&
+		(Clean[0] == TEXT('"') || Clean[0] == TEXT('\'')))
+	{
+		FString Unwrapped;
+		if (TryUnwrapSingleValue(Clean, Unwrapped))
+		{
+			Clean = MoveTemp(Unwrapped);
+		}
+	}
+
+	// Always populate every value field — designers can read whichever interpretation suits.
+	P.StringValue = Clean;
+	P.NumberValue = FCString::Atof(*Clean);
+
+	bool bBoolMatched = false;
+	P.BoolValue = ParseBoolish(Clean, bBoolMatched);
+
+	// Resolve against env objects then characters. RefreshSnapshot reads live
+	// actor/component transforms and bounds, which are game-thread-only — this
+	// parse path is invoked from the WebRTC data callback which can land on a
+	// transport thread (see UConvaiSubsystem::OnDataPacketReceived). Only run
+	// the resolver eagerly when we're already on the game thread; otherwise
+	// designers' first call to "Resolve Goal Location" from BP will do the resolve
+	// on the game thread.
+	const bool bSafeToResolve = IsInGameThread();
+	if (const FConvaiObjectEntry* Obj = Env.FindObject(Clean))
+	{
+		P.RefValue = *Obj;
+		if (bSafeToResolve) { P.RefValue.RefreshSnapshot(); }
+	}
+	else if (const FConvaiObjectEntry* Chr = Env.FindCharacter(Clean))
+	{
+		P.RefValue = *Chr;
+		if (bSafeToResolve) { P.RefValue.RefreshSnapshot(); }
+	}
+
+	// Type set: pass through declared type unless Auto, in which case infer from
+	// what coerced cleanly (Reference > Number > Bool > String).
+	if (DeclaredType != EConvaiActionParamType::Auto)
+	{
+		P.Type = DeclaredType;
+	}
+	else
+	{
+		if (!P.RefValue.Name.IsEmpty())          { P.Type = EConvaiActionParamType::Reference; }
+		else if (ValueLooksFullyNumeric(Clean))  { P.Type = EConvaiActionParamType::Number; }
+		else if (bBoolMatched)                   { P.Type = EConvaiActionParamType::Bool; }
+		else                                     { P.Type = EConvaiActionParamType::String; }
+	}
+
+	// Constraint validation: enum byte resolution when the template declared an EnumType
+	// (ByteValue holds the underlying enum value on match so handlers can Byte-to-Enum<…>
+	// in BP), otherwise a Choices fuzzy match when the caller supplied a list. Either path
+	// flips bOutConstraintMatched to false on miss so the caller can warn with full
+	// action/param context — we don't drop the value, just signal.
+	// Enum/Choices are declared constraints — on match, canonicalize StringValue to the
+	// declared label so handlers see a value that's actually in the set (avoids casing /
+	// paraphrase drift like "rotating clockwise" vs "RotatingClockwise"). On miss the raw
+	// LLM string passes through and the caller is signaled via bOutConstraintMatched.
+	if (DeclaredType == EConvaiActionParamType::Enum && EnumType != nullptr)
+	{
+		const TArray<FString> Labels = UConvaiActions::GetEnumLabels(EnumType);
+		int32 Distance = 0;
+		const int32 Idx = UConvaiActions::FuzzyFindLabel(Clean, Labels, Distance);
+		if (Idx != INDEX_NONE)
+		{
+			P.ByteValue = static_cast<uint8>(EnumType->GetValueByIndex(Idx));
+			P.StringValue = Labels[Idx];
+		}
+		else if (bOutConstraintMatched)
+		{
+			*bOutConstraintMatched = false;
+		}
+	}
+	else if (Choices && Choices->Num() > 0)
+	{
+		int32 Distance = 0;
+		const int32 Idx = UConvaiActions::FuzzyFindLabel(Clean, *Choices, Distance);
+		if (Idx != INDEX_NONE)
+		{
+			P.StringValue = (*Choices)[Idx];
+		}
+		else if (bOutConstraintMatched)
+		{
+			*bOutConstraintMatched = false;
+		}
+	}
+
+	return P;
+}
+
+// ── BP accessors for FConvaiResultAction.Parameters ──────────────────
+
+FConvaiResultParam UConvaiActions::GetFirstParam(const FConvaiResultAction& Action)
+{
+	// Return the first parameter in insertion order. Use an iterator rather than a
+	// range-for with an immediate return: the latter has an unreachable loop increment,
+	// which Android/Clang flags as an error (-Wunreachable-code-loop-increment, promoted
+	// to -Werror on UE 5.8). MSVC/Win64 is unaffected either way.
+	auto It = Action.Parameters.CreateConstIterator();
+	if (It)
+	{
+		return It->Value;
+	}
+	return FConvaiResultParam();
+}
+
+FConvaiResultParam UConvaiActions::GetParam(const FConvaiResultAction& Action, const FString& Name)
+{
+	if (const FConvaiResultParam* Found = Action.Parameters.Find(Name))
+	{
+		return *Found;
+	}
+	return FConvaiResultParam();
+}
+
+EConvaiActionParamType UConvaiActions::GetParamType(const FConvaiResultAction& Action, const FString& Name)
+{
+	if (const FConvaiResultParam* Found = Action.Parameters.Find(Name))
+	{
+		return Found->Type;
+	}
+	return EConvaiActionParamType::String;
+}
+
+FString UConvaiActions::GetParamAsString(const FConvaiResultAction& Action, const FString& Name)
+{
+	if (const FConvaiResultParam* Found = Action.Parameters.Find(Name))
+	{
+		return Found->StringValue;
+	}
+	return FString();
+}
+
+float UConvaiActions::GetParamAsNumber(const FConvaiResultAction& Action, const FString& Name)
+{
+	if (const FConvaiResultParam* Found = Action.Parameters.Find(Name))
+	{
+		return Found->NumberValue;
+	}
+	return 0.f;
+}
+
+bool UConvaiActions::GetParamAsBool(const FConvaiResultAction& Action, const FString& Name)
+{
+	if (const FConvaiResultParam* Found = Action.Parameters.Find(Name))
+	{
+		return Found->BoolValue;
+	}
+	return false;
+}
+
+FConvaiObjectEntry UConvaiActions::GetParamAsRef(const FConvaiResultAction& Action, const FString& Name)
+{
+	if (const FConvaiResultParam* Found = Action.Parameters.Find(Name))
+	{
+		return Found->RefValue;
+	}
+	return FConvaiObjectEntry();
+}
+
+uint8 UConvaiActions::GetParamAsByte(const FConvaiResultAction& Action, const FString& Name)
+{
+	if (const FConvaiResultParam* Found = Action.Parameters.Find(Name))
+	{
+		return Found->ByteValue;
+	}
+	return 0;
+}
+
+bool UConvaiActions::HasParam(const FConvaiResultAction& Action, const FString& Name)
+{
+	return Action.Parameters.Contains(Name);
+}
+
+void UConvaiActions::ResolveGoalLocation(FConvaiObjectEntry& Entry,
+	AActor* SourceActor,
+	AActor*& OutMoveTargetActor,
+	AActor*& OutGoalActor, USceneComponent*& OutGoalComponent,
+	FVector& OutGoalLocation, float& OutAcceptanceRadius,
+	bool& bOutMoveToLocation, bool& bOutSuccess,
+	bool& bOutAlreadyThere,
+	bool& bOutReachable, FVector& OutPathEndPoint, TArray<FVector>& OutPathPoints,
+	float& OutGoalTravelDistance, int32& OutMovementPointIndex)
+{
+	// Thin BP wrapper — the struct method owns all the logic (Movement Point
+	// selection + object-fallback position math + arrival check + reachability
+	// path query).
+	Entry.ResolveGoalLocation(SourceActor,
+		OutGoalActor, OutGoalComponent, OutGoalLocation, OutAcceptanceRadius,
+		bOutMoveToLocation, bOutSuccess,
+		bOutAlreadyThere, bOutReachable, OutPathEndPoint, OutPathPoints,
+		OutGoalTravelDistance, OutMovementPointIndex);
+	// AI Move To prefers its Target Actor pin whenever non-null — so hand out
+	// an actor exactly when resolution succeeded AND following the actor IS
+	// the goal; null when a Movement Point or component location won (or the
+	// entry failed to resolve). Wiring Target Actor + Destination straight
+	// into one AI Move To is then correct with no branch. (Object Actor stays
+	// populated either way for non-movement consumers.)
+	OutMoveTargetActor = (bOutSuccess && !bOutMoveToLocation) ? OutGoalActor : nullptr;
+}
+
+// ── DEPRECATED — kept for back-compat with prior-iteration BP graphs ──
+
+FString UConvaiActions::GetActionParam(const FConvaiExtraParams& Params, const FString& Name)
+{
+	const FString* Found = Params.NamedParams.Find(Name);
+	return Found ? *Found : FString();
+}
+
+float UConvaiActions::GetActionParamAsNumber(const FConvaiExtraParams& Params, const FString& Name)
+{
+	const FString* Found = Params.NamedParams.Find(Name);
+	if (!Found) { return 0.f; }
+	return FCString::Atof(**Found);
+}
+
+bool UConvaiActions::HasActionParam(const FConvaiExtraParams& Params, const FString& Name)
+{
+	return Params.NamedParams.Contains(Name);
+}

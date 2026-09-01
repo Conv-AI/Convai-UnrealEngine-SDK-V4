@@ -1,0 +1,214 @@
+/**
+ * Copyright Convai Inc. All Rights Reserved.
+ *
+ * ChangelogViewModel.cpp
+ *
+ * Implementation of the changelog view model.
+ */
+
+#include "MVVM/ChangelogViewModel.h"
+#include "ConvaiEditor.h"
+#include "Services/IContentFeedService.h"
+#include "Logging/ConvaiEditorConfigLog.h"
+#include "Utility/ContentFilteringUtility.h"
+#include "Async/Async.h"
+#include "Events/EventAggregator.h"
+#include "Events/EventTypes.h"
+
+FChangelogViewModel::FChangelogViewModel(TSharedPtr<IContentFeedService> InService, bool bInEnableStaleWhileRevalidate)
+    : IsLoading(false), HasError(false), ErrorMessage(TEXT("")), ChangelogCount(0), Service(InService),
+      bEnableStaleWhileRevalidate(bInEnableStaleWhileRevalidate)
+{
+    if (!Service.IsValid())
+    {
+        UE_LOG(LogConvaiEditorConfig, Error, TEXT("ChangelogViewModel: Service is null - ViewModel will not function"));
+    }
+}
+
+FChangelogViewModel::~FChangelogViewModel()
+{
+}
+
+void FChangelogViewModel::Initialize()
+{
+    FViewModelBase::Initialize();
+
+    TWeakPtr<FChangelogViewModel> WeakViewModel = SharedThis(this);
+    NetworkRestoredSubscription = ConvaiEditor::FEventAggregator::Get().Subscribe<ConvaiEditor::FNetworkRestoredEvent>(
+        WeakViewModel,
+        [WeakViewModel](const ConvaiEditor::FNetworkRestoredEvent &Event)
+        {
+            if (TSharedPtr<FChangelogViewModel> ViewModel = WeakViewModel.Pin())
+            {
+                ViewModel->RefreshChangelogs();
+            }
+        });
+
+    if (Service.IsValid())
+    {
+        LoadChangelogs(false);
+    }
+    else
+    {
+        UE_LOG(LogConvaiEditorConfig, Error, TEXT("ChangelogViewModel: Cannot initialize - service unavailable"));
+        OnChangelogsLoadFailed(TEXT("Changelog service not available"));
+    }
+}
+
+void FChangelogViewModel::Shutdown()
+{
+    NetworkRestoredSubscription.Unsubscribe();
+
+    ClearChangelogs();
+
+    FViewModelBase::Shutdown();
+}
+
+void FChangelogViewModel::RefreshChangelogs()
+{
+    LoadChangelogs(true);
+}
+
+void FChangelogViewModel::LoadChangelogs(bool bForceRefresh)
+{
+    if (!Service.IsValid())
+    {
+        UE_LOG(LogConvaiEditorConfig, Error, TEXT("ChangelogViewModel: Cannot load changelogs - service unavailable"));
+        OnChangelogsLoadFailed(TEXT("Service not available"));
+        return;
+    }
+
+    IsLoading.Set(true);
+    HasError.Set(false);
+    ErrorMessage.Set(TEXT(""));
+
+    TFuture<FContentFeedResult> Future = Service->GetContentAsync(bForceRefresh);
+
+    Future.Then([this, bForceRefresh](TFuture<FContentFeedResult> ResultFuture)
+                {
+        FContentFeedResult Result = ResultFuture.Get();
+        AsyncTask(ENamedThreads::GameThread, [this, Result, bForceRefresh]()
+        {
+            if (Result.bSuccess)
+            {
+                OnChangelogsLoaded(Result.ChangelogItems, Result.bFromCache);
+
+                if (!bForceRefresh && bEnableStaleWhileRevalidate && Result.bFromCache)
+                {
+                    StartBackgroundRefresh();
+                }
+            }
+            else
+            {
+                OnChangelogsLoadFailed(Result.ErrorMessage);
+            }
+        }); });
+}
+
+void FChangelogViewModel::OnChangelogsLoaded(const TArray<FConvaiChangelogItem> &Items, bool bWasFromCache)
+{
+    TArray<FConvaiChangelogItem> FilteredItems = FContentFilteringUtility::FilterChangelogs(Items);
+
+    Changelogs = FilteredItems;
+
+    IsLoading.Set(false);
+    HasError.Set(false);
+    ErrorMessage.Set(TEXT(""));
+    ChangelogCount.Set(Changelogs.Num());
+
+    BroadcastInvalidated();
+}
+
+void FChangelogViewModel::OnChangelogsLoadFailed(const FString &Error)
+{
+    UE_LOG(LogConvaiEditorConfig, Warning, TEXT("ChangelogViewModel: Failed to load changelogs - %s"), *Error);
+
+    IsLoading.Set(false);
+    HasError.Set(true);
+    ErrorMessage.Set(Error);
+
+    BroadcastInvalidated();
+}
+
+void FChangelogViewModel::StartBackgroundRefresh()
+{
+    if (bBackgroundRefreshInFlight || !Service.IsValid())
+    {
+        return;
+    }
+
+    bBackgroundRefreshInFlight = true;
+
+    TFuture<FContentFeedResult> RefreshFuture = Service->GetContentAsync(true);
+    RefreshFuture.Then([this](TFuture<FContentFeedResult> ResultFuture)
+                       {
+        const FContentFeedResult Result = ResultFuture.Get();
+        AsyncTask(ENamedThreads::GameThread, [this, Result]()
+        {
+            bBackgroundRefreshInFlight = false;
+
+            if (!Result.bSuccess)
+            {
+                UE_LOG(LogConvaiEditorConfig, Verbose, TEXT("Background changelog refresh failed - %s"), *Result.ErrorMessage);
+                return;
+            }
+
+            const TArray<FConvaiChangelogItem> FilteredItems = FContentFilteringUtility::FilterChangelogs(Result.ChangelogItems);
+            if (AreChangelogsEqual(Changelogs, FilteredItems))
+            {
+                return;
+            }
+
+            Changelogs = FilteredItems;
+            ChangelogCount.Set(Changelogs.Num());
+            HasError.Set(false);
+            ErrorMessage.Set(TEXT(""));
+            BroadcastInvalidated();
+        }); });
+}
+
+bool FChangelogViewModel::AreChangelogsEqual(const TArray<FConvaiChangelogItem> &A, const TArray<FConvaiChangelogItem> &B) const
+{
+    if (A.Num() != B.Num())
+    {
+        return false;
+    }
+
+    for (int32 Index = 0; Index < A.Num(); ++Index)
+    {
+        const FConvaiChangelogItem &L = A[Index];
+        const FConvaiChangelogItem &R = B[Index];
+        if (L.ID != R.ID ||
+            L.Version != R.Version ||
+            L.Date != R.Date ||
+            L.Changes != R.Changes ||
+            L.URL != R.URL)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void FChangelogViewModel::ClearChangelogs()
+{
+    bBackgroundRefreshInFlight = false;
+    Changelogs.Empty();
+    ChangelogCount.Set(0);
+    HasError.Set(false);
+    ErrorMessage.Set(TEXT(""));
+    IsLoading.Set(false);
+
+    BroadcastInvalidated();
+}
+
+double FChangelogViewModel::GetCacheAge() const
+{
+    if (!Service.IsValid())
+    {
+        return -1.0;
+    }
+
+    return Service->GetCacheAge();
+}

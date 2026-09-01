@@ -1,0 +1,10 @@
+{
+    "S1" : "Hey, what time is it right now?",
+    "S2" : "Tell me a fun fact about the ocean.",
+    "S3" : "Can you give me a quick recipe for pancakes?",
+    "M1" : "I'm planning a weekend trip to Paris next month. Could you suggest three museums I shouldn't miss, and tell me a little about each one?",
+    "M2" : "I've been trying to learn Python and I keep getting confused by list comprehensions. Could you explain how they work and walk me through a simple example?",
+    "M3" : "Thanks for using LiveKit. Welcome to this simple C++ example. We hope you enjoy exploring the SDK.",
+    "L1" : "I'm thinking about switching careers from accounting to software engineering, and I'm a little nervous about whether it's the right move. I'm thirty-four, I've been in finance for ten years, and I've been teaching myself programming on weekends for about a year now. I enjoy it, but I'm not sure how realistic the jump really is. What advice would you give someone in my position, and what should I focus on first?",
+    "L2" : "Last weekend I went hiking with a couple of friends and we got pretty lost on the trail because the trail markers had been worn away by weather. We ended up bushwhacking for almost two hours before we found the parking lot. So, what should someone actually carry on a day hike beyond water and a phone, and how do you stay calm when you realize you're off route?"
+}

@@ -1,0 +1,205 @@
+// Copyright 2022 Convai Inc. All Rights Reserved.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "UObject/NoExportTypes.h"
+#include "ConvaiConnectionInterface.h"
+#include "ConvaiDefinitions.h"
+#include "ConvaiConnectionSessionProxy.generated.h"
+
+// Forward declarations
+class UConvaiSubsystem;
+
+/**
+ * Connection session proxy class
+ * Acts as an intermediary between components and the Convai subsystem
+ */
+UCLASS()
+class CONVAI_API UConvaiConnectionSessionProxy : public UObject
+{
+    GENERATED_BODY()
+
+public:
+    UConvaiConnectionSessionProxy();
+    virtual ~UConvaiConnectionSessionProxy();
+    
+	//~ Begin UObject Interface.
+	virtual void BeginDestroy() override;
+	//~ End UObject Interface.
+
+    /**
+     * Acquire a connection proxy for the given CharacterID.
+     * If a reusable orphaned connection exists for this character, it is returned.
+     * Otherwise a new connection is established.
+     * @param WorldContextObject - Any UObject to resolve the subsystem from
+     * @param CharacterID - The character to connect to
+     * @param ConnectionInterface - The interface to receive callbacks
+     * @return The session proxy, or nullptr on failure
+     */
+    static UConvaiConnectionSessionProxy* RequestSessionProxy(
+        UObject* WorldContextObject,
+        const FString& CharacterID,
+        TScriptInterface<IConvaiConnectionInterface> ConnectionInterface);
+
+    /**
+     * Release a connection proxy. The underlying connection enters an orphaned state
+     * and stays alive for a configurable grace period before being torn down.
+     * @param WorldContextObject - Any UObject to resolve the subsystem from
+     * @param CharacterID - The character this proxy was connected to
+     * @param Proxy - The proxy to release
+     */
+    static void ReturnSessionProxy(
+        UObject* WorldContextObject,
+        const FString& CharacterID,
+        UConvaiConnectionSessionProxy* Proxy);
+
+    /**
+     * Initialize the session with a connection interface
+     * @param InConnectionInterface - The interface to receive callbacks
+     * @param bInIsPlayer - Whether this is a player session
+     * @return True if initialization was successful
+     */
+    bool Initialize(TScriptInterface<IConvaiConnectionInterface> InConnectionInterface, bool bInIsPlayer);
+    
+    /**
+     * Connect to the Convai service
+     * @param CharacterID - The ID of the character to connect to (ignored for player sessions)
+     * @return True if connection was initiated successfully
+     */
+    bool Connect(const FString& CharacterID = TEXT(""));
+    
+    /**
+     * Disconnect from the Convai service
+     */
+    void Disconnect();
+    
+    /**
+     * Send audio data through the session
+     * @param AudioData - The audio data to send
+     * @param NumFrames - The number of frames in the audio data
+     * @return The number of bytes sent, or -1 on failure
+     */
+    int32 SendAudio(const int16_t* AudioData, size_t NumFrames) const;
+
+    void SendImage(uint32 Width, uint32 Height, TArray<uint8> Data) const;
+
+    void StopVideoPublishing() const;
+    
+    void SendTextMessage(const FString& Message) const;
+    
+    void SendTriggerMessage(const FString& Trigger_Name, const FString& Trigger_Message) const;
+    
+    void UpdateTemplateKeys(const TMap<FString, FString>& Template_Keys) const;
+    
+    void UpdateDynamicInfo(const FString& Context_Text) const;
+
+    void ToggleSTT(bool bMuted) const;
+
+    /** Ends the user's turn immediately, without waiting for the server VAD's silence timer. */
+    void ForceUserStoppedSpeaking() const;
+
+    void UpdateContext(const FString& Text, EC_ContextUpdateMode Mode, EC_RunLLMOption ShouldRespond,
+        const FConvaiObjectEntry* OptionalAttention = nullptr) const;
+    
+    /**
+     * Get the proxy ID
+     * @return The unique ID for this proxy
+     */
+    FGuid GetProxyID() const { return ProxyID; }
+    
+    /**
+     * Get the connection interface
+     * @return The connection interface for this proxy
+     */
+    TScriptInterface<IConvaiConnectionInterface> GetConnectionInterface() const { return ConnectionInterface; }
+
+    /**
+     * Rebind the connection interface to a new owner.
+     * Used by UConvaiConnectionManager when reattaching an orphaned proxy to a new component.
+     */
+    void RebindConnectionInterface(TScriptInterface<IConvaiConnectionInterface> NewConnectionInterface);
+
+    /**
+     * Clear the connection interface so callbacks are silently dropped.
+     * Used when the proxy enters orphaned state.
+     */
+    void ClearConnectionInterface();
+
+    // ── Advertised action contract ─────────────────────────────────────
+    // The action templates sent to the server when this connection's /connect
+    // payload was built, plus which built-in action names were injected. The
+    // contract belongs to the CONNECTION, not its current component owner: an
+    // orphaned proxy can be rebound to a new component without another
+    // /connect, and that component must parse/dispatch against what the server
+    // was actually told. Stored as UPROPERTYs so referenced assets (e.g. a
+    // param's UEnum) stay GC-alive even after the live Environment drops them.
+
+    /** Record the contract when the /connect payload is built (set-once per connection). */
+    void SetAdvertisedActions(const TArray<FConvaiAction>& Actions, const TArray<FString>& BuiltInNames)
+    {
+        AdvertisedActions = Actions;
+        AdvertisedBuiltInNames = BuiltInNames;
+        bHasAdvertisedActions = true;
+    }
+
+    /** True once a /connect payload was built on this connection — even one that advertised zero actions. */
+    bool HasAdvertisedActions() const { return bHasAdvertisedActions; }
+
+    void GetAdvertisedActions(TArray<FConvaiAction>& OutActions, TArray<FString>& OutBuiltInNames) const
+    {
+        OutActions = AdvertisedActions;
+        OutBuiltInNames = AdvertisedBuiltInNames;
+    }
+
+private:
+    UPROPERTY(Transient)
+    TArray<FConvaiAction> AdvertisedActions;
+
+    UPROPERTY(Transient)
+    TArray<FString> AdvertisedBuiltInNames;
+
+    bool bHasAdvertisedActions = false;
+
+public:
+    
+    /**
+     * Check if this is a player session
+     * @return True if this is a player session, false otherwise
+     */
+    bool IsPlayerSession() const { return bIsPlayer; }
+
+    /**
+     * Get the connection state for this session
+     * @return The current connection state for this session
+     */
+    EC_ConnectionState GetConnectionState() const;
+
+    /**
+     * Set the attendee ID for this session
+     * @param InAttendeeId - The attendee ID to associate with this session
+     */
+    void SetAttendeeId(const FString& InAttendeeId) { AttendeeId = InAttendeeId; }
+
+    /**
+     * Get the attendee ID for this session
+     * @return The attendee ID associated with this session
+     */
+    const FString& GetAttendeeId() const { return AttendeeId; }
+
+private:
+    // Unique ID for this proxy
+    FGuid ProxyID;
+
+    // Connection interface for callbacks. UPROPERTY so GC traces the UObject
+    // side of the TScriptInterface — non-component implementers (e.g. the
+    // prep-connection listener) have no other rooting path.
+    UPROPERTY()
+    TScriptInterface<IConvaiConnectionInterface> ConnectionInterface;
+    
+    // Is this a player session
+    bool bIsPlayer;
+
+    // The attendee ID associated with this session (e.g., CharacterID for chatbots)
+    FString AttendeeId;
+};

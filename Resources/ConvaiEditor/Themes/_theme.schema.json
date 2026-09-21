@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["info", "tokens"],
+  "properties": {
+    "info": {
+      "type": "object",
+      "required": ["id", "label", "version"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for the theme"
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-readable name for the theme"
+        },
+        "version": {
+          "type": "integer",
+          "description": "Version number of the theme"
+        },
+        "inherits": {
+          "type": ["string", "null"],
+          "description": "Optional parent theme to inherit values from"
+        }
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "properties": {
+        "color": {
+          "type": "object",
+          "description": "Color tokens for the theme. All layout values have been moved to constants for better performance.",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{8})$"
+          }
+        }
+      },
+      "required": ["color"]
+    },
+    "brushes": {
+      "type": "object",
+      "description": "Brush definitions for images and icons",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  }
+} 

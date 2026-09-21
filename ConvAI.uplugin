@@ -1,0 +1,145 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "4.0.0-beta.31",
+  "FriendlyName": "Convai",
+  "Description": "Adds new blueprint functions and components to integrate Convai API.",
+  "Category": "Runtime",
+  "CreatedBy": "Convai Inc.",
+  "CreatedByURL": "https://convai.com/",
+  "DocsURL": "",
+  "MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/696326c90d80462b8775712d2b6cc2a7",
+  "SupportURL": "",
+  "CanContainContent": true,
+  "Modules": [
+    {
+      "Name": "ConvaiAvatarStudioEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": [
+        "Win64"
+      ]
+    },
+    {
+      "Name": "Convai",
+      "Type": "Runtime",
+      "LoadingPhase": "PreDefault",
+      "PlatformAllowList": [
+        "Win64",
+        "Android"
+      ]
+    },
+    {
+      "Name": "ConvaiEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [
+        "Win64"
+      ]
+    },
+    {
+      "Name": "ConvaiSceneTagging",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": [
+        "Win64"
+      ]
+    },
+    {
+      "Name": "ConvaiSceneTaggingEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [
+        "Win64"
+      ]
+    },
+    {
+      "Name": "ConvaiAnimGraph",
+      "Type": "UncookedOnly",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": [
+        "Win64"
+      ]
+    },
+    {
+      "Name": "ConvaiVisionBase",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": [
+        "Win64",
+        "Android"
+      ]
+    },
+    {
+      "Name": "ConvaiToolset",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [
+        "Win64"
+      ]
+    },
+    {
+      "Name": "ConvaiCloudProjectsEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": [
+        "Win64"
+      ]
+    },
+    {
+      "Name": "ConvaiPSAudioCapture",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": [
+        "Win64",
+        "Linux"
+      ]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "Niagara",
+      "Enabled": true,
+      "TargetAllowList": [
+        "Editor"
+      ]
+    },
+    {
+      "Name": "ToolsetRegistry",
+      "Enabled": true,
+      "Optional": true
+    },
+    {
+      "Name": "AudioCapture",
+      "Enabled": true
+    },
+    {
+      "Name": "AndroidPermission",
+      "Enabled": true
+    },
+    {
+      "Name": "EditorScriptingUtilities",
+      "Enabled": true
+    },
+    {
+      "Name": "PropertyAccessEditor",
+      "Enabled": true
+    },
+    {
+      "Name": "AndroidFileServer",
+      "Enabled": false
+    },
+    {
+      "Name": "Synthesis",
+      "Enabled": true
+    },
+    {
+      "Name": "PixelStreaming",
+      "Enabled": true,
+      "PlatformAllowList": [
+        "Win64",
+        "Linux"
+      ]
+    }
+  ]
+}

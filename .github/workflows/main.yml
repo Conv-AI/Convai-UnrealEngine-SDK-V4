@@ -1,0 +1,1006 @@
+name: Build and Release Unreal Plugin
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - beta
+  workflow_dispatch:
+    inputs:
+      ue_5_3:
+        description: Unreal Engine 5.3
+        type: boolean
+        default: false
+      ue_5_4:
+        description: Unreal Engine 5.4
+        type: boolean
+        default: false
+      ue_5_5:
+        description: Unreal Engine 5.5
+        type: boolean
+        default: false
+      ue_5_6:
+        description: Unreal Engine 5.6
+        type: boolean
+        default: false
+      ue_5_7:
+        description: Unreal Engine 5.7
+        type: boolean
+        default: true
+      ue_5_8:
+        description: Unreal Engine 5.8
+        type: boolean
+        default: true
+      windows:
+        description: Windows game builds (the Windows editor is always included)
+        type: boolean
+        default: true
+      android:
+        description: Android game builds
+        type: boolean
+        default: false
+      build_number:
+        description: 'Feature build number (empty: next number; leave empty on normal channels)'
+        type: string
+        required: false
+        default: ''
+
+# The runner, MSVC configuration and integration project are shared across branches.
+concurrency:
+  group: unreal-plugin-release-${{ github.repository }}
+  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: read
+  checks: read
+
+env:
+  # Capacity guard before extraction and each engine, not a guaranteed peak budget.
+  CONVAI_RELEASE_MIN_FREE_GIB: ${{ vars.CONVAI_RELEASE_MIN_FREE_GIB || '30' }}
+
+jobs:
+  checkout-code:
+    runs-on: UE-Dev-Runner
+    outputs:
+      version_name: ${{ steps.plan.outputs.version_name }}
+      feature: ${{ steps.plan.outputs.feature }}
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version and selected engines
+        id: plan
+        env:
+          RELEASE_INPUTS_JSON: ${{ toJSON(inputs) }}
+        run: ./.github/scripts/Release.ps1 -Mode Plan
+        shell: pwsh
+  check-version:
+    needs: checkout-code
+    runs-on: UE-Dev-Runner
+    outputs:
+      release_exists: ${{ steps.check_release.outputs.release_exists }}
+    env:
+      RELEASE_PLAN_JSON: ${{ needs.checkout-code.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check exact release tag and requested assets
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./.github/scripts/Release.ps1 -Mode Check
+        shell: pwsh
+  preflight:
+    needs: [checkout-code, check-version]
+    runs-on: UE-Dev-Runner
+    if: needs.check-version.outputs.release_exists == 'false'
+    env:
+      RELEASE_PLAN_JSON: ${{ needs.checkout-code.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate notes and selected engine installs before building
+        run: ./.github/scripts/Release.ps1 -Mode Preflight
+        shell: pwsh
+  build-and-package:
+    needs: [checkout-code, check-version, preflight]
+    runs-on: UE-Dev-Runner
+    if: needs.check-version.outputs.release_exists == 'false'
+    outputs:
+      output_root: ${{ steps.paths.outputs.output_root }}
+      release_files: ${{ steps.assets.outputs.release_files }}
+      marketplace_files: ${{ steps.assets.outputs.marketplace_files }}
+    env:
+      RELEASE_PLAN_JSON: ${{ needs.checkout-code.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Define isolated run paths
+        id: paths
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          . ./.github/scripts/RunnerStorage.ps1
+          $diagnostics = Join-Path $env:RUNNER_TEMP "ConvaiReleaseDiagnostics/$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $output = Initialize-ConvaiRunnerStorage -OutputParent 'E:/Output' -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID -Attempt $env:GITHUB_RUN_ATTEMPT -PlanJson $env:RELEASE_PLAN_JSON `
+            -MinimumGiB $env:CONVAI_RELEASE_MIN_FREE_GIB -DiagnosticsRoot $diagnostics
+          "ue_root=E:/Software" >> $env:GITHUB_OUTPUT
+          "output_root=$output" >> $env:GITHUB_OUTPUT
+          "diagnostics_root=$diagnostics" >> $env:GITHUB_OUTPUT
+          "plugin_path=$env:GITHUB_WORKSPACE/ConvAI.uplugin" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Verify distribution staging against the current source and resource files
+        # Development tests are intentionally absent from public committed-source exports.
+        if: hashFiles('.github/scripts/Distribution.Tests.ps1') != ''
+        run: ./.github/scripts/Distribution.Tests.ps1
+        shell: pwsh
+      - name: Set release version and strip internal automation from the runner build copy
+        run: |
+          . ./.github/scripts/Distribution.ps1
+          $plan = $env:RELEASE_PLAN_JSON | ConvertFrom-Json
+          $descriptor = Get-Content -LiteralPath ConvAI.uplugin -Raw | ConvertFrom-Json
+          $descriptor.VersionName = $plan.version
+          $descriptor | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath ConvAI.uplugin -Encoding UTF8
+          Remove-ConvaiDistributionTests $env:GITHUB_WORKSPACE
+        shell: pwsh
+      - name: Extract and Copy Dependencies
+        run: |
+          try {
+            $dependencies_dir = "E:/Dependencies_V4"
+            $plugin_dir = "${{ github.workspace }}"
+            $skills_overlay = Join-Path $env:RUNNER_TEMP "ConvaiAgentSkillsOverlay"
+            $native_core_overlay = Join-Path $env:RUNNER_TEMP "ConvaiSceneAutoTaggerCoreOverlay"
+            $content_zip = "$dependencies_dir/Content.zip"
+            $thirdparty_zip = "$dependencies_dir/ThirdParty.zip"
+            $plugin_content_dir = "$plugin_dir/Content"
+            $plugin_thirdparty_dir = "$plugin_dir/Source/ThirdParty"
+
+            # Content normally comes from the runner dependency archive. AgentSkills
+            # are the sole source-controlled exception because they must ship with
+            # the APIs they document. Preserve them before replacing Content, then
+            # overlay them only into the UE 5.8 package below.
+            if (Test-Path $skills_overlay) {
+                Remove-Item -Recurse -Force $skills_overlay
+            }
+            $checked_in_skills = "$plugin_content_dir/Skills"
+            if (Test-Path $checked_in_skills) {
+                New-Item -ItemType Directory -Force -Path $skills_overlay | Out-Null
+                Copy-Item -Path "$checked_in_skills/*" -Destination $skills_overlay -Recurse -Force
+                Write-Host "Preserved source-controlled AgentSkills for the UE 5.8 package."
+            }
+
+            # The Scene Auto Tagger core is a checksum-locked, source-controlled
+            # dependency. Preserve it while replacing runner-managed ThirdParty
+            # dependencies, then restore it over any stale archive copy.
+            if (Test-Path $native_core_overlay) {
+                Remove-Item -Recurse -Force $native_core_overlay
+            }
+            $checked_in_native_core = "$plugin_thirdparty_dir/ConvaiSceneAutoTaggerCore"
+            if (!(Test-Path $checked_in_native_core)) {
+                throw "Checked-in Scene Auto Tagger core bundle is missing: $checked_in_native_core"
+            }
+            Copy-Item -Path $checked_in_native_core -Destination $native_core_overlay -Recurse -Force
+
+            if (Test-Path $plugin_content_dir) {
+                Remove-Item -Recurse -Force $plugin_content_dir
+            }
+            if (Test-Path $plugin_thirdparty_dir) {
+                Remove-Item -Recurse -Force $plugin_thirdparty_dir
+            }
+            Expand-Archive -Path $content_zip -DestinationPath $plugin_dir
+            Expand-Archive -Path $thirdparty_zip -DestinationPath "$plugin_dir/Source"
+
+            $expanded_native_core = "$plugin_thirdparty_dir/ConvaiSceneAutoTaggerCore"
+            if (Test-Path $expanded_native_core) {
+                Remove-Item -Recurse -Force $expanded_native_core
+            }
+            Copy-Item -Path $native_core_overlay -Destination $expanded_native_core -Recurse -Force
+
+            # The convenience chatbot Blueprint must wire the Escort action.
+            # Fail before the expensive engine matrix if the VM's dependency
+            # archive was not refreshed.
+            $chatbot_blueprint = "$plugin_content_dir/ConvaiConveniencePack/ConvaiBPComponent/BP_ConvaiChatbotComponent.uasset"
+            if (-not (Test-Path $chatbot_blueprint)) {
+                throw "The dependency bundle is missing BP_ConvaiChatbotComponent.uasset."
+            }
+            $chatbot_blueprint_text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($chatbot_blueprint))
+            if (-not $chatbot_blueprint_text.Contains("Escort")) {
+                throw "The dependency bundle contains an older BP_ConvaiChatbotComponent without the Escort action."
+            }
+            Write-Host "Verified the dependency-managed chatbot Blueprint includes Escort."
+
+            # The dependency archive may still contain an older Skills snapshot.
+            # Keep Skills absent from UE 5.3-5.7 and use only the checked-in
+            # overlay when the UE 5.8 iteration is reached.
+            $dependency_skills = "$plugin_content_dir/Skills"
+            if (Test-Path $dependency_skills) {
+                Remove-Item -Recurse -Force $dependency_skills
+                Write-Host "Removed dependency-managed Skills; the source-controlled overlay will be applied for UE 5.8."
+            }
+            Write-Host "Dependencies extracted and copied successfully."
+          } catch {
+            Write-Host "Failed to extract and copy dependencies. Error: $_"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Copy ThirdParty DLLs to Binaries folder
+        run: |
+          $plugin_dir = "${{ github.workspace }}"
+          $thirdparty_base = "$plugin_dir/Source/ThirdParty/ConvaiWebRTC/lib/release"
+          
+          # Windows DLLs
+          $win64_source = "$thirdparty_base/win64"
+          $win64_dest = "$plugin_dir/Binaries/Win64"
+          if (Test-Path $win64_source) {
+              if (-not (Test-Path $win64_dest)) {
+                  New-Item -Path $win64_dest -ItemType Directory -Force | Out-Null
+              }
+              $dlls = Get-ChildItem -Path $win64_source -Filter "*.dll"
+              foreach ($dll in $dlls) {
+                  Copy-Item -Path $dll.FullName -Destination $win64_dest -Force
+                  Write-Host "Copied $($dll.Name) to $win64_dest"
+              }
+          } else {
+              Write-Host "Win64 ThirdParty path not found: $win64_source"
+          }
+          
+          # Mac dylibs (if they exist)
+          $mac_source = "$thirdparty_base/mac"
+          $mac_dest = "$plugin_dir/Binaries/Mac"
+          if (Test-Path $mac_source) {
+              if (-not (Test-Path $mac_dest)) {
+                  New-Item -Path $mac_dest -ItemType Directory -Force | Out-Null
+              }
+              $dylibs = Get-ChildItem -Path $mac_source -Filter "*.dylib" -ErrorAction SilentlyContinue
+              foreach ($dylib in $dylibs) {
+                  Copy-Item -Path $dylib.FullName -Destination $mac_dest -Force
+                  Write-Host "Copied $($dylib.Name) to $mac_dest"
+              }
+          } else {
+              Write-Host "Mac ThirdParty path not found (skipping): $mac_source"
+          }
+          
+          # Linux shared objects (if they exist)
+          $linux_source = "$thirdparty_base/linux"
+          $linux_dest = "$plugin_dir/Binaries/Linux"
+          if (Test-Path $linux_source) {
+              if (-not (Test-Path $linux_dest)) {
+                  New-Item -Path $linux_dest -ItemType Directory -Force | Out-Null
+              }
+              $sos = Get-ChildItem -Path $linux_source -Filter "*.so" -ErrorAction SilentlyContinue
+              foreach ($so in $sos) {
+                  Copy-Item -Path $so.FullName -Destination $linux_dest -Force
+                  Write-Host "Copied $($so.Name) to $linux_dest"
+              }
+              # Also copy versioned .so files (e.g., .so.1, .so.1.0.0)
+              $sos_versioned = Get-ChildItem -Path $linux_source -Filter "*.so.*" -ErrorAction SilentlyContinue
+              foreach ($so in $sos_versioned) {
+                  Copy-Item -Path $so.FullName -Destination $linux_dest -Force
+                  Write-Host "Copied $($so.Name) to $linux_dest"
+              }
+          } else {
+              Write-Host "Linux ThirdParty path not found (skipping): $linux_source"
+          }
+
+          # Android shared objects (if they exist)
+          $android_archs = @("armeabi-v7a", "arm64-v8a", "x86_64")
+          foreach ($arch in $android_archs) {
+              $android_source = "$thirdparty_base/android/$arch"
+              $android_dest = "$plugin_dir/Binaries/Android/$arch"
+              if (Test-Path $android_source) {
+                  if (-not (Test-Path $android_dest)) {
+                      New-Item -Path $android_dest -ItemType Directory -Force | Out-Null
+                  }
+                  $sos = Get-ChildItem -Path $android_source -Filter "*.so" -ErrorAction SilentlyContinue
+                  foreach ($so in $sos) {
+                      Copy-Item -Path $so.FullName -Destination $android_dest -Force
+                      Write-Host "Copied $($so.Name) to $android_dest"
+                  }
+                  $afiles = Get-ChildItem -Path $android_source -Filter "*.a" -ErrorAction SilentlyContinue
+                  foreach ($afile in $afiles) {
+                      Copy-Item -Path $afile.FullName -Destination $android_dest -Force
+                      Write-Host "Copied $($afile.Name) to $android_dest"
+                  }
+              } else {
+                  Write-Host "Android ThirdParty path not found (skipping): $android_source"
+              }
+          }
+
+          Write-Host "ThirdParty binaries copied to plugin Binaries folder successfully."
+        shell: pwsh
+
+      - name: Build and package selected Unreal versions
+        run: |
+          . ./.github/scripts/RunnerStorage.ps1
+          . ./.github/scripts/PlatformCoverage.ps1
+          try {
+            $plan = $env:RELEASE_PLAN_JSON | ConvertFrom-Json
+            $versions = @($plan.versions)
+            $targetPlatforms = @($plan.platforms) -join '+'
+            $plugin_dir = "${{ github.workspace }}"
+            $dependencies_mh_fix_dir = "E:/Dependencies_MH_fix"
+            $mh_fix_applied = $false
+            function Test-AccessiblePath([string]$PathValue) {
+                if ([string]::IsNullOrWhiteSpace($PathValue)) {
+                    return $false
+                }
+                try {
+                    Get-Item -LiteralPath $PathValue -ErrorAction Stop | Out-Null
+                    return $true
+                } catch {
+                    Write-Host "Path is not accessible: $PathValue ($($_.Exception.Message))"
+                    return $false
+                }
+            }
+
+            function Get-FirstAccessiblePath([string[]]$Candidates, [string]$Label) {
+                foreach ($candidate in $Candidates) {
+                    if (Test-AccessiblePath $candidate) {
+                        return $candidate
+                    }
+                }
+
+                $candidate_list = ($Candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) -join "; "
+                throw "No accessible path found for ${Label}. Candidates checked: $candidate_list"
+            }
+
+            function Set-AndroidToolchainEnv([string]$NdkVersion, [string]$Label) {
+                $sdk_candidates = @(
+                    $env:ANDROID_HOME,
+                    $env:ANDROID_SDK_ROOT,
+                    [Environment]::GetEnvironmentVariable("ANDROID_HOME", "Machine"),
+                    [Environment]::GetEnvironmentVariable("ANDROID_SDK_ROOT", "Machine"),
+                    [Environment]::GetEnvironmentVariable("ANDROID_HOME", "User"),
+                    [Environment]::GetEnvironmentVariable("ANDROID_SDK_ROOT", "User"),
+                    (Join-Path $env:LOCALAPPDATA "Android\Sdk"),
+                    "C:\Users\convaidev\AppData\Local\Android\Sdk"
+                ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+                $android_sdk_root = Get-FirstAccessiblePath -Candidates $sdk_candidates -Label "Android SDK root for $Label"
+                $ndk_root = Join-Path $android_sdk_root "ndk\$NdkVersion"
+                $java_candidates = @(
+                    $env:JAVA_HOME,
+                    [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine"),
+                    [Environment]::GetEnvironmentVariable("JAVA_HOME", "User"),
+                    "C:\Program Files\Android\Android Studio\jbr",
+                    "C:\Program Files\Android\Android Studio\jre"
+                ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+                $env:ANDROID_HOME = $android_sdk_root
+                $env:ANDROID_SDK_ROOT = $android_sdk_root
+                $env:NDK_ROOT = $ndk_root
+                $env:NDKROOT = $ndk_root
+                $env:ANDROID_NDK_ROOT = $ndk_root
+
+                $env:JAVA_HOME = Get-FirstAccessiblePath -Candidates $java_candidates -Label "JAVA_HOME for $Label"
+
+                $required_paths = @{
+                    "ANDROID_HOME" = $env:ANDROID_HOME
+                    "ANDROID_SDK_ROOT" = $env:ANDROID_SDK_ROOT
+                    "NDK_ROOT" = $env:NDK_ROOT
+                    "NDKROOT" = $env:NDKROOT
+                    "ANDROID_NDK_ROOT" = $env:ANDROID_NDK_ROOT
+                    "JAVA_HOME" = $env:JAVA_HOME
+                }
+
+                foreach ($entry in $required_paths.GetEnumerator()) {
+                    if (-not (Test-AccessiblePath $entry.Value)) {
+                        throw "$($entry.Key) path is not accessible for ${Label}: $($entry.Value)"
+                    }
+                }
+
+                Write-Host "Resolved Android toolchain for $Label"
+                Write-Host "ANDROID_HOME=$env:ANDROID_HOME"
+                Write-Host "ANDROID_SDK_ROOT=$env:ANDROID_SDK_ROOT"
+                Write-Host "NDK_ROOT=$env:NDK_ROOT"
+                Write-Host "NDKROOT=$env:NDKROOT"
+                Write-Host "ANDROID_NDK_ROOT=$env:ANDROID_NDK_ROOT"
+                Write-Host "JAVA_HOME=$env:JAVA_HOME"
+            }
+
+            # Restore the full descriptor before applying each engine's exclusions.
+            $base_descriptor = Get-Content "${{ steps.paths.outputs.plugin_path }}" -Raw
+            foreach ($version in $versions) {
+                [IO.File]::WriteAllText("${{ steps.paths.outputs.plugin_path }}", $base_descriptor, [Text.UTF8Encoding]::new($false))
+                & "$plugin_dir/Resources/ConfigureEngineModules.ps1" -PluginRoot $plugin_dir -EngineRoot "${{ steps.paths.outputs.ue_root }}/UE_$version"
+                Assert-ConvaiRunnerFreeSpace '${{ steps.paths.outputs.output_root }}' $env:CONVAI_RELEASE_MIN_FREE_GIB
+                # Apply once at the first selected engine >=5.6, including a 5.7/5.8-only build.
+                if ([Version]$version -ge [Version]"5.6" -and -not $mh_fix_applied) {
+                    $mh_fix_content = "$dependencies_mh_fix_dir/Content"
+                    $plugin_content_dir = "$plugin_dir/Content"
+                    if (Test-Path $mh_fix_content) {
+                        Write-Host "Applying MetaHuman fixes from $mh_fix_content to $plugin_content_dir..."
+                        Copy-Item -Path "$mh_fix_content/*" -Destination $plugin_content_dir -Recurse -Force
+                        Write-Host "MetaHuman fixes applied successfully for UE 5.6 and above."
+                        $mh_fix_applied = $true
+                    } else {
+                        throw "Required MetaHuman fix directory not found at $mh_fix_content"
+                    }
+                }
+
+                if ($version -eq "5.8") {
+                    $skills_overlay = Join-Path $env:RUNNER_TEMP "ConvaiAgentSkillsOverlay"
+                    $plugin_skills = "$plugin_dir/Content/Skills"
+                    if (Test-Path $skills_overlay) {
+                        if (Test-Path $plugin_skills) {
+                            Remove-Item -Recurse -Force $plugin_skills
+                        }
+                        New-Item -ItemType Directory -Force -Path $plugin_skills | Out-Null
+                        Copy-Item -Path "$skills_overlay/*" -Destination $plugin_skills -Recurse -Force
+                        Write-Host "Overlaid source-controlled AgentSkills for UE 5.8."
+                    } else {
+                        throw "No source-controlled AgentSkills overlay was found; refusing to publish an incomplete UE 5.8 package."
+                    }
+                } else {
+                    # A later version-specific dependency overlay (for example
+                    # the UE 5.6 MetaHuman fix above) must not reintroduce Skills.
+                    $plugin_skills = "$plugin_dir/Content/Skills"
+                    if (Test-Path $plugin_skills) {
+                        Remove-Item -Recurse -Force $plugin_skills
+                        Write-Host "Removed dependency-managed Skills from the UE $version package."
+                    }
+                }
+
+                # Windows-only previews need no Android SDK, NDK or Java install.
+                if ('Android' -in $plan.platforms) {
+                    if ([Version]$version -ge [Version]'5.6') {
+                        Set-AndroidToolchainEnv -NdkVersion "27.2.12479018" -Label "UE $version"
+                    } else {
+                        Set-AndroidToolchainEnv -NdkVersion "25.1.8937393" -Label "UE $version"
+                    }
+                }
+
+                # Set LINUX_MULTIARCH_ROOT based on Unreal version
+                if ($version -eq "5.7" -or $version -eq "5.8") {
+                    $env:LINUX_MULTIARCH_ROOT = "C:\UnrealToolchains\v26_clang-20.1.8-rockylinux8"
+                    Write-Host "Set LINUX_MULTIARCH_ROOT to $env:LINUX_MULTIARCH_ROOT for UE $version"
+                } else {
+                    $env:LINUX_MULTIARCH_ROOT = "C:\UnrealToolchains\v25_clang-18.1.0-rockylinux8"
+                    Write-Host "Set LINUX_MULTIARCH_ROOT to $env:LINUX_MULTIARCH_ROOT for UE $version"
+                }
+
+                $ue_version_path = "${{ steps.paths.outputs.ue_root }}/UE_$version"
+                $output_path = "${{ steps.paths.outputs.output_root }}/V$version/Convai"
+                if (Test-Path $output_path) {
+                    Remove-Item -Recurse -Force -Path "$output_path/*"
+                } else {
+                    New-Item -Path $output_path -ItemType Directory
+                }
+                # ---- Per-version MSVC toolchain pin ----
+                # UE <=5.7 require MSVC <=14.39 (14.40+ breaks engine code, e.g. ConcurrentLinearAllocator).
+                # UE 5.8 requires >=14.44 (14.38 fails compiling its container headers). Both toolchains
+                # must be installed on the runner. BuildPlugin ignores the -CompilerVersion arg, so pin via
+                # the user BuildConfiguration.xml; a surgical regex swap preserves other settings.
+                $msvcVersion = if ($version -eq "5.8") { "14.44.35207" } else { "14.38.33130" }
+                $ubtDir = Join-Path $env:APPDATA "Unreal Engine\UnrealBuildTool"
+                $ubtConfig = Join-Path $ubtDir "BuildConfiguration.xml"
+                New-Item -ItemType Directory -Force -Path $ubtDir | Out-Null
+                if (Test-Path $ubtConfig) { $cfgXml = Get-Content $ubtConfig -Raw } else { $cfgXml = "<?xml version=`"1.0`" encoding=`"utf-8`"?>`r`n<Configuration xmlns=`"https://www.unrealengine.com/BuildConfiguration`">`r`n</Configuration>" }
+                if ($cfgXml -match "<CompilerVersion>") {
+                    $cfgXml = $cfgXml -replace "<CompilerVersion>[^<]*</CompilerVersion>", "<CompilerVersion>$msvcVersion</CompilerVersion>"
+                    $cfgXml = $cfgXml -replace "<ToolchainVersion>[^<]*</ToolchainVersion>", "<ToolchainVersion>$msvcVersion</ToolchainVersion>"
+                } else {
+                    $cfgXml = $cfgXml -replace "</Configuration>", "  <WindowsPlatform>`r`n    <CompilerVersion>$msvcVersion</CompilerVersion>`r`n    <ToolchainVersion>$msvcVersion</ToolchainVersion>`r`n  </WindowsPlatform>`r`n</Configuration>"
+                }
+                Set-Content -Path $ubtConfig -Value $cfgXml -Encoding UTF8
+                Write-Host "Pinned MSVC $msvcVersion for UE $version"
+
+                # 5.8+ packages must ship ToolsetRegistry as a required reference (see dev PR #86).
+                if ([Version]$version -ge [Version]"5.8") {
+                    $descriptor_path = "${{ steps.paths.outputs.plugin_path }}"
+                    $descriptor = Get-Content $descriptor_path -Raw | ConvertFrom-Json
+                    $toolset_ref = $descriptor.Plugins | Where-Object { $_.Name -eq "ToolsetRegistry" }
+                    if (-not $toolset_ref) {
+                        throw "ConvAI.uplugin no longer references ToolsetRegistry; update the UE $version descriptor patch in main.yml."
+                    }
+                    if ($toolset_ref.PSObject.Properties.Name -contains "Optional") {
+                        $toolset_ref.PSObject.Properties.Remove("Optional")
+                    }
+                    $descriptor | ConvertTo-Json -Depth 50 | Set-Content $descriptor_path -Encoding UTF8
+                    Write-Host "Marked ToolsetRegistry as a required plugin reference for the UE $version package."
+                }
+
+                Write-Host "Starting packaging for UE_$version ($targetPlatforms; Windows host editor included)..."
+                $uat_path = "$ue_version_path/Engine/Build/BatchFiles/RunUAT.bat"
+                & $uat_path BuildPlugin -Plugin="${{ steps.paths.outputs.plugin_path }}" -Package="$output_path" -Rocket -Marketplace "-TargetPlatforms=$targetPlatforms"
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "Packaging failed for UE_$version. Exit code: $LASTEXITCODE"
+                    exit $LASTEXITCODE
+                }
+                Write-Host "Packaged for UE_$version at $output_path"
+                Assert-ConvaiPlatformCoverage -PluginRoot $output_path -Platforms @($plan.platforms)
+                & "$plugin_dir/Resources/ConfigureEngineModules.ps1" -PluginRoot $output_path -EngineRoot $ue_version_path -CheckOnly
+
+                # Verify the packaged descriptor: ToolsetRegistry required on 5.8+, optional below.
+                $packaged_descriptor = Get-Content "$output_path/ConvAI.uplugin" -Raw | ConvertFrom-Json
+                $packaged_refs = @($packaged_descriptor.Plugins | Where-Object { $_.Name -eq "ToolsetRegistry" })
+                if ($packaged_refs.Count -ne 1) {
+                    throw "UE ${version} package: expected exactly one ToolsetRegistry reference, found $($packaged_refs.Count)."
+                }
+                $is_optional = ($packaged_refs[0].PSObject.Properties.Name -contains "Optional") -and $packaged_refs[0].Optional
+                if ([Version]$version -ge [Version]"5.8" -and $is_optional) {
+                    throw "UE ${version} package still ships ToolsetRegistry as Optional; installed engines would drop it and ConvaiToolset would fail to load."
+                }
+                if ([Version]$version -lt [Version]"5.8" -and -not $is_optional) {
+                    throw "UE ${version} package ships ToolsetRegistry as required, but the plugin does not exist before 5.8; projects would fail to open."
+                }
+                Write-Host "UE ${version} package descriptor check passed (ToolsetRegistry optional=$is_optional)."
+
+            }
+          } catch {
+            Write-Host "Packaging failed for Unreal Engine version $version. Error: $_"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Editor-open smoke test (UE 5.6-5.8 + TestProject)
+        timeout-minutes: 90
+        run: |
+          # Open the editor headless with the packaged plugin; fail on any plugin/module load error.
+          $output_base = "${{ steps.paths.outputs.output_root }}"
+          $ue_root = "${{ steps.paths.outputs.ue_root }}"
+
+          function Invoke-EditorOpenCheck {
+              param(
+                  [string]$Version,
+                  [string]$UProject,
+                  [string]$LogPath,
+                  [string]$Label,
+                  [bool]$RequireToolsetMount
+              )
+              $editor_cmd = "$ue_root/UE_$Version/Engine/Binaries/Win64/UnrealEditor-Cmd.exe"
+              Write-Host "${Label}: opening editor (headless, UE $Version)..."
+              $editor_args = @(
+                  $UProject,
+                  "-nullrhi", "-RenderOffscreen", "-unattended", "-nosplash", "-nopause", "-nop4", "-NoLiveCoding",
+                  "-abslog=$LogPath", "-ExecCmds=QUIT_EDITOR"
+              )
+              $proc = Start-Process -FilePath $editor_cmd -ArgumentList $editor_args -PassThru -WindowStyle Hidden
+              # 20-minute watchdog per editor launch.
+              $timed_out = $false
+              if (-not $proc.WaitForExit(20 * 60 * 1000)) {
+                  Write-Host "${Label}: editor still running after 20 minutes; killing process tree."
+                  & taskkill /PID $proc.Id /T /F | Out-Null
+                  Start-Sleep -Seconds 5
+                  $timed_out = $true
+                  $editor_exit = -1
+              } else {
+                  $proc.WaitForExit()
+                  $editor_exit = $proc.ExitCode
+                  if ($null -eq $editor_exit) { $editor_exit = 999 }
+              }
+
+              if (!(Test-Path $LogPath)) {
+                  Write-Error "${Label}: editor produced no log at $LogPath (exit code $editor_exit)"
+                  exit 1
+              }
+              $log = Get-Content $LogPath -Raw
+              $failures = @()
+              if ($timed_out) { $failures += "editor timed out after 20 minutes" }
+              elseif ($editor_exit -ne 0) { $failures += "editor exited with code $editor_exit" }
+              foreach ($pattern in @("LogPluginManager: Error", "failed to load because module", "Missing import:")) {
+                  if ($log -match [regex]::Escape($pattern)) { $failures += "log contains '$pattern'" }
+              }
+              if ($log -notmatch "Mounting .*plugin ConvAI") {
+                  $failures += "the ConvAI plugin was never mounted"
+              }
+              if ($RequireToolsetMount -and $log -notmatch "Mounting Engine plugin ToolsetRegistry") {
+                  $failures += "ToolsetRegistry was not mounted; ConvaiToolset will fail to load for installed-engine users"
+              }
+
+              if ($failures.Count -gt 0) {
+                  Write-Host "=== $Label editor-open FAILED: $($failures -join '; ') ==="
+                  Get-Content $LogPath | Select-String -Pattern "Error|Missing import|failed to load|Mounting .*plugin ConvAI" |
+                      Select-Object -Last 80 | ForEach-Object { Write-Host $_.Line }
+                  exit 1
+              }
+              Write-Host "$Label editor-open passed (exit 0, plugin mounted, no plugin-load errors)."
+          }
+
+          # 1) Minimal blueprint-only project on UE 5.6/5.7/5.8 with the matching packaged plugin.
+          foreach ($version in @(($env:RELEASE_PLAN_JSON | ConvertFrom-Json).versions | Where-Object { [Version]$_ -ge [Version]"5.6" })) {
+              $packaged_plugin = "$output_base/V$version/Convai"
+              if (!(Test-Path "$packaged_plugin/ConvAI.uplugin")) {
+                  Write-Error "Packaged plugin not found for UE ${version}: $packaged_plugin"
+                  exit 1
+              }
+              $smoke_root = "$output_base/EditorOpenSmoke/V$version"
+              if (Test-Path $smoke_root) { Remove-Item -Recurse -Force $smoke_root }
+              New-Item -ItemType Directory -Force -Path "$smoke_root/Plugins" | Out-Null
+              Copy-Item -Recurse -Force $packaged_plugin "$smoke_root/Plugins/Convai"
+
+              # Blueprint-only host project with the plugin explicitly enabled.
+              @{
+                  FileVersion = 3
+                  EngineAssociation = $version
+                  Category = ""
+                  Description = "CI editor-open smoke test"
+                  Plugins = @(@{ Name = "ConvAI"; Enabled = $true })
+              } | ConvertTo-Json -Depth 10 | Set-Content "$smoke_root/EditorOpenSmoke.uproject" -Encoding UTF8
+
+              Invoke-EditorOpenCheck -Version $version -UProject "$smoke_root/EditorOpenSmoke.uproject" `
+                  -LogPath "$smoke_root/EditorOpen.log" -Label "UE $version (blueprint-only)" `
+                  -RequireToolsetMount ($version -eq "5.8")
+          }
+
+          if ("5.6" -notin ($env:RELEASE_PLAN_JSON | ConvertFrom-Json).versions) { return }
+          # 2) The integration TestProject with the packaged plugin, on UE 5.6.
+          $test_project_path = "E:/Software/TestProject"
+          $plugin_folder = "$test_project_path/Plugins"
+          if (Test-Path $plugin_folder) { Remove-Item -Recurse -Force $plugin_folder }
+          New-Item -Path $plugin_folder -ItemType Directory | Out-Null
+          Copy-Item -Recurse -Force "$output_base/V5.6/Convai" $plugin_folder
+          Invoke-EditorOpenCheck -Version "5.6" -UProject "$test_project_path/TestProject.uproject" `
+              -LogPath "$output_base/EditorOpenSmoke/TestProject-UE5.6.log" -Label "TestProject (UE 5.6)" `
+              -RequireToolsetMount $false
+        shell: pwsh
+
+      - name: Test packaging for Windows UE 5.6
+        if: contains(fromJSON(needs.checkout-code.outputs.plan).versions, '5.6') && contains(fromJSON(needs.checkout-code.outputs.plan).platforms, 'Win64')
+        run: |
+          try {
+            $ue_version_path = "${{ steps.paths.outputs.ue_root }}/UE_5.6"
+            $output_path = "${{ steps.paths.outputs.output_root }}/V5.6"
+            $test_project_path = "E:/Software/TestProject"
+            $plugin_folder = "$test_project_path/Plugins"
+            if (Test-Path $plugin_folder) {
+                Remove-Item -Recurse -Force $plugin_folder
+            }
+            New-Item -Path $plugin_folder -ItemType Directory
+            Copy-Item -Recurse -Force "$output_path/Convai" $plugin_folder
+            Write-Host "Copied the plugin to the TestProject."
+            $uat_path = "$ue_version_path/Engine/Build/BatchFiles/RunUAT.bat"
+            Write-Host "Starting project packaging for Unreal 5.6..."
+            & $uat_path BuildCookRun `
+            -project="$test_project_path/TestProject.uproject" `
+            -noP4 -utf8output -platform=Win64 -clientconfig=Shipping -cook -stage -package -compressed -pak `
+            -build -prereqs -distribution -archive `
+            -archivedirectory="$test_project_path/Windows"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "Packaging failed for UE_$version. Exit code: $LASTEXITCODE"
+                exit $LASTEXITCODE
+            }
+            Write-Host "Project packaging completed successfully for Unreal 5.6"
+          } catch {
+            Write-Host "Project packaging failed for Unreal Engine 5.6. Error: $_"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Test packaging for Android UE 5.6
+        if: contains(fromJSON(needs.checkout-code.outputs.plan).versions, '5.6') && contains(fromJSON(needs.checkout-code.outputs.plan).platforms, 'Android')
+        run: |
+          try {
+            function Test-AccessiblePath([string]$PathValue) {
+                if ([string]::IsNullOrWhiteSpace($PathValue)) {
+                    return $false
+                }
+
+                try {
+                    Get-Item -LiteralPath $PathValue -ErrorAction Stop | Out-Null
+                    return $true
+                } catch {
+                    Write-Host "Path is not accessible: $PathValue ($($_.Exception.Message))"
+                    return $false
+                }
+            }
+
+            function Get-FirstAccessiblePath([string[]]$Candidates, [string]$Label) {
+                foreach ($candidate in $Candidates) {
+                    if (Test-AccessiblePath $candidate) {
+                        return $candidate
+                    }
+                }
+
+                $candidate_list = ($Candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) -join "; "
+                throw "No accessible path found for ${Label}. Candidates checked: $candidate_list"
+            }
+
+            function Set-AndroidToolchainEnv([string]$NdkVersion, [string]$Label) {
+                $sdk_candidates = @(
+                    $env:ANDROID_HOME,
+                    $env:ANDROID_SDK_ROOT,
+                    [Environment]::GetEnvironmentVariable("ANDROID_HOME", "Machine"),
+                    [Environment]::GetEnvironmentVariable("ANDROID_SDK_ROOT", "Machine"),
+                    [Environment]::GetEnvironmentVariable("ANDROID_HOME", "User"),
+                    [Environment]::GetEnvironmentVariable("ANDROID_SDK_ROOT", "User"),
+                    (Join-Path $env:LOCALAPPDATA "Android\Sdk"),
+                    "C:\Users\convaidev\AppData\Local\Android\Sdk"
+                ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+                $android_sdk_root = Get-FirstAccessiblePath -Candidates $sdk_candidates -Label "Android SDK root for $Label"
+                $ndk_root = Join-Path $android_sdk_root "ndk\$NdkVersion"
+                $java_candidates = @(
+                    $env:JAVA_HOME,
+                    [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine"),
+                    [Environment]::GetEnvironmentVariable("JAVA_HOME", "User"),
+                    "C:\Program Files\Android\Android Studio\jbr",
+                    "C:\Program Files\Android\Android Studio\jre"
+                ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+                $env:ANDROID_HOME = $android_sdk_root
+                $env:ANDROID_SDK_ROOT = $android_sdk_root
+                $env:NDK_ROOT = $ndk_root
+                $env:NDKROOT = $ndk_root
+                $env:ANDROID_NDK_ROOT = $ndk_root
+
+                $env:JAVA_HOME = Get-FirstAccessiblePath -Candidates $java_candidates -Label "JAVA_HOME for $Label"
+
+                $required_paths = @{
+                    "ANDROID_HOME" = $env:ANDROID_HOME
+                    "ANDROID_SDK_ROOT" = $env:ANDROID_SDK_ROOT
+                    "NDK_ROOT" = $env:NDK_ROOT
+                    "NDKROOT" = $env:NDKROOT
+                    "ANDROID_NDK_ROOT" = $env:ANDROID_NDK_ROOT
+                    "JAVA_HOME" = $env:JAVA_HOME
+                }
+
+                foreach ($entry in $required_paths.GetEnumerator()) {
+                    if (-not (Test-AccessiblePath $entry.Value)) {
+                        throw "$($entry.Key) path is not accessible for ${Label}: $($entry.Value)"
+                    }
+                }
+
+                Write-Host "Resolved Android toolchain for $Label"
+                Write-Host "ANDROID_HOME=$env:ANDROID_HOME"
+                Write-Host "ANDROID_SDK_ROOT=$env:ANDROID_SDK_ROOT"
+                Write-Host "NDK_ROOT=$env:NDK_ROOT"
+                Write-Host "NDKROOT=$env:NDKROOT"
+                Write-Host "ANDROID_NDK_ROOT=$env:ANDROID_NDK_ROOT"
+                Write-Host "JAVA_HOME=$env:JAVA_HOME"
+            }
+
+            Set-AndroidToolchainEnv -NdkVersion "27.2.12479018" -Label "Android UE 5.6 test packaging"
+
+            $ue_version_path = "${{ steps.paths.outputs.ue_root }}/UE_5.6"
+            $output_path = "${{ steps.paths.outputs.output_root }}/V5.6"
+            $test_project_path = "E:/Software/TestProject"
+            $plugin_folder = "$test_project_path/Plugins"
+            if (Test-Path $plugin_folder) {
+                Remove-Item -Recurse -Force $plugin_folder
+            }
+            New-Item -Path $plugin_folder -ItemType Directory
+            Copy-Item -Recurse -Force "$output_path/Convai" $plugin_folder
+            Write-Host "Copied the plugin to the TestProject."
+            $uat_path = "$ue_version_path/Engine/Build/BatchFiles/RunUAT.bat"
+
+            $staged_path = "$test_project_path/Saved/StagedBuilds"
+            if (Test-Path $staged_path) {
+                Write-Host "Removing old staged Android builds..."
+                Remove-Item -Recurse -Force "$staged_path/Android*" -ErrorAction SilentlyContinue
+            }
+            
+            $android_archive_path = "$test_project_path/Android"
+            if (Test-Path $android_archive_path) {
+                Write-Host "Removing old Android archive..."
+                Remove-Item -Recurse -Force $android_archive_path -ErrorAction SilentlyContinue
+            }
+
+            Write-Host "Starting Android project packaging for Unreal 5.6..."
+            & $uat_path BuildCookRun `
+            -project="$test_project_path/TestProject.uproject" `
+            -noP4 -utf8output -platform=Android -clientconfig=Shipping -cook -stage -package -compressed -pak `
+            -build -prereqs -distribution -archive `
+            -archivedirectory="$test_project_path/Android" 
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "Android packaging failed for UE 5.6. Exit code: $LASTEXITCODE"
+                exit $LASTEXITCODE
+            }
+            Write-Host "Android project packaging completed successfully for Unreal 5.6"
+          } catch {
+            Write-Host "Android project packaging failed for Unreal Engine 5.6. Error: $_"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Cleanup plugin artifacts before zipping
+        run: |
+          . ./.github/scripts/Distribution.ps1
+          $versions = @(($env:RELEASE_PLAN_JSON | ConvertFrom-Json).versions)
+          $output_base = "${{ steps.paths.outputs.output_root }}"
+          $cleanup_script = "E:/Scripts/Cleanup.py"
+          
+          # Check if script exists
+          if (!(Test-Path $cleanup_script)) {
+              Write-Error "Cleanup script not found at $cleanup_script"
+              exit 1
+          }
+
+          foreach ($version in $versions) {
+              $plugin_root = "$output_base/V$version/Convai"
+
+              if (!(Test-Path $plugin_root)) {
+                  Write-Warning "Plugin path not found: $plugin_root (skipping)"
+                  continue
+              }
+
+              $log = python $cleanup_script cleanup --path $plugin_root 2>&1
+
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "Cleanup failed for UE$version (exit $LASTEXITCODE)"
+                  Write-Host ($log | Out-String)
+                  exit $LASTEXITCODE
+              }
+
+              # Cleanup may rewrite ThirdParty content. Restore the exact
+              # lock-pinned Source/ThirdParty native-core bundle.
+              $source_core = "${{ github.workspace }}/Source/ThirdParty/ConvaiSceneAutoTaggerCore"
+              $packaged_core = "$plugin_root/Source/ThirdParty/ConvaiSceneAutoTaggerCore"
+              if (Test-Path $packaged_core) { Remove-Item -Recurse -Force $packaged_core }
+              New-Item -ItemType Directory -Force -Path (Split-Path $packaged_core -Parent) | Out-Null
+              Copy-Item -Path $source_core -Destination $packaged_core -Recurse -Force
+              # Validate the final output too; runner cleanup must not reintroduce test resources.
+              Remove-ConvaiDistributionTests $plugin_root
+          }
+        shell: pwsh
+
+      - name: Zip Plugin for each version
+        run: |
+          . ./.github/scripts/Distribution.ps1
+          . ./.github/scripts/Release.ps1
+          . ./.github/scripts/PlatformCoverage.ps1
+          try {
+            $plan = $env:RELEASE_PLAN_JSON | ConvertFrom-Json
+            $versions = @($plan.versions)
+            $output_base = "${{ steps.paths.outputs.output_root }}"
+            foreach ($version in $versions) {
+                $output_path = "$output_base/V$version"
+                $zip_name = Join-Path $output_base (Get-ReleaseArchiveName $version $plan.platforms)
+                Assert-ConvaiDistribution (Join-Path $output_path 'Convai')
+                Assert-ConvaiPlatformCoverage -PluginRoot (Join-Path $output_path 'Convai') -Platforms @($plan.platforms)
+                Compress-Archive -Path "$output_path" -DestinationPath "$zip_name" -Force
+                Write-Host "Zipped plugin for UE$version at $zip_name"
+            }
+          } catch {
+            Write-Host "Zipping failed. Error: $_"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Zip no-binaries package for each version
+        if: needs.checkout-code.outputs.feature != 'true'
+        run: |
+          . ./.github/scripts/Distribution.ps1
+          . ./.github/scripts/Release.ps1
+          try {
+            # Per-version source packages for Fab (Fab compiles Unreal modules
+            # from source). Unreal-generated binaries are removed; the locked
+            # native libraries remain under Source/ThirdParty and are staged by UBT.
+            $plan = $env:RELEASE_PLAN_JSON | ConvertFrom-Json
+            $versions = @($plan.versions)
+            $output_base = "${{ steps.paths.outputs.output_root }}"
+            foreach ($version in $versions) {
+                $src_plugin = "$output_base/V$version/Convai"
+                if (!(Test-Path $src_plugin)) { Write-Warning "Missing $src_plugin (skipping)"; continue }
+
+                $staging_parent = "$output_base/NoBinaries/V$version"
+                $staging_plugin = "$staging_parent/Convai"
+                if (Test-Path $staging_parent) { Remove-Item -Recurse -Force $staging_parent }
+                New-Item -ItemType Directory -Force -Path $staging_plugin | Out-Null
+
+                Get-ChildItem -Path $src_plugin -Force |
+                    Where-Object { @("Binaries","Intermediate","DerivedDataCache") -notcontains $_.Name } |
+                    ForEach-Object { Copy-Item -Path $_.FullName -Destination $staging_plugin -Recurse -Force }
+
+                # Defensive: strip any nested Binaries/Intermediate.
+                Get-ChildItem -Path $staging_plugin -Recurse -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -in @("Binaries","Intermediate","DerivedDataCache") } |
+                    ForEach-Object { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
+
+                # Drop the "Installed" precompiled flag so Fab compiles from source.
+                $uplugin = Join-Path $staging_plugin "ConvAI.uplugin"
+                if (Test-Path $uplugin) {
+                    $j = Get-Content $uplugin -Raw | ConvertFrom-Json
+                    if ($j.PSObject.Properties.Name -contains "Installed") { $j.PSObject.Properties.Remove("Installed") }
+                    $j | ConvertTo-Json -Depth 50 | Set-Content $uplugin -Encoding UTF8
+                }
+
+                $zip_out = Join-Path $output_base (Get-ReleaseArchiveName $version $plan.platforms $true)
+                Assert-ConvaiDistribution $staging_plugin
+                if (Test-Path $zip_out) { Remove-Item -Force $zip_out }
+                Compress-Archive -Path $staging_plugin -DestinationPath $zip_out -Force
+                Write-Host "Created no-binaries package: $zip_out"
+            }
+          } catch {
+            Write-Host "No-binaries packaging failed. Error: $_"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Validate selected release files
+        id: assets
+        run: |
+          . ./.github/scripts/RunnerStorage.ps1
+          . ./.github/scripts/Release.ps1
+          $plan = $env:RELEASE_PLAN_JSON | ConvertFrom-Json
+          $root = "${{ steps.paths.outputs.output_root }}"
+          $standard = @(Get-ReleaseArchiveNames $plan | ForEach-Object { Join-Path $root $_ })
+          $marketplace = @()
+          if (-not $plan.feature) { $marketplace = @(Get-ReleaseArchiveNames $plan $true | ForEach-Object { Join-Path $root $_ }) }
+          foreach ($file in @($standard) + @($marketplace)) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-Item -LiteralPath $file).Length -eq 0) { throw "Missing release file: $file" }
+          }
+          "release_files<<FILES" >> $env:GITHUB_OUTPUT
+          $standard >> $env:GITHUB_OUTPUT
+          "$root/release-plan.json" >> $env:GITHUB_OUTPUT
+          "FILES" >> $env:GITHUB_OUTPUT
+          "marketplace_files<<FILES" >> $env:GITHUB_OUTPUT
+          $marketplace >> $env:GITHUB_OUTPUT
+          if (-not $plan.feature) { "$root/release-plan.json" >> $env:GITHUB_OUTPUT }
+          "FILES" >> $env:GITHUB_OUTPUT
+          $plan | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath "$root/release-plan.json" -Encoding UTF8
+          # Persist readiness before any cleanup so later failures preserve valid ZIPs.
+          Set-ConvaiRunnerArchivesReady -OutputParent 'E:/Output' -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID -Attempt $env:GITHUB_RUN_ATTEMPT -Archives (@($standard) + @($marketplace))
+        shell: pwsh
+      - name: Release this attempt's build intermediates
+        if: always() && !cancelled() && steps.paths.outputs.output_root != ''
+        run: |
+          . ./.github/scripts/RunnerStorage.ps1
+          Complete-ConvaiRunnerBuild -OutputParent 'E:/Output' -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID -Attempt $env:GITHUB_RUN_ATTEMPT -Succeeded ('${{ job.status }}' -eq 'success') `
+            -DiagnosticsRoot '${{ steps.paths.outputs.diagnostics_root }}'
+        shell: pwsh
+      - name: Preserve small release diagnostics
+        if: always() && steps.paths.outputs.diagnostics_root != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.paths.outputs.diagnostics_root }}
+          if-no-files-found: ignore
+          retention-days: 14
+          include-hidden-files: true
+
+  compress-and-release:
+    needs: [checkout-code, check-version, build-and-package]
+    runs-on: UE-Dev-Runner
+    if: needs.check-version.outputs.release_exists == 'false'
+    env:
+      RELEASE_PLAN_JSON: ${{ needs.checkout-code.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract the planned release notes
+        run: ./.github/scripts/Release.ps1 -Mode Notes
+        shell: pwsh
+      - name: Publish tags only for the exact built commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./.github/scripts/Release.ps1 -Mode Tag
+        shell: pwsh
+      - name: Publish Marketplace source-only pre-release
+        if: needs.checkout-code.outputs.feature != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: marketplace-${{ needs.checkout-code.outputs.version_name }}
+          target_commitish: ${{ github.sha }}
+          name: "Marketplace - ${{ needs.checkout-code.outputs.version_name }}"
+          prerelease: true
+          make_latest: false
+          body: "Source-only Marketplace packages. Unreal-generated binaries are excluded; checksum-locked third-party libraries remain under Source/ThirdParty."
+          fail_on_unmatched_files: true
+          files: ${{ needs.build-and-package.outputs.marketplace_files }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Standard release is last, preserving the normal channel completion marker.
+      - name: Publish downloadable plugin release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.checkout-code.outputs.version_name }}
+          target_commitish: ${{ github.sha }}
+          name: "Convai Unreal Engine SDK Version ${{ needs.checkout-code.outputs.version_name }}"
+          prerelease: ${{ needs.checkout-code.outputs.feature == 'true' }}
+          make_latest: ${{ needs.checkout-code.outputs.feature == 'true' && 'false' || 'true' }}
+          body_path: release_notes.md
+          fail_on_unmatched_files: true
+          files: ${{ needs.build-and-package.outputs.release_files }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove verified published attempt output
+        # The normal success condition deliberately keeps ZIPs/plan if publication fails.
+        run: |
+          . ./.github/scripts/RunnerStorage.ps1
+          Complete-ConvaiPublishedOutput -OutputParent 'E:/Output' -Repository $env:GITHUB_REPOSITORY `
+            -RunId $env:GITHUB_RUN_ID -BuildOutputRoot '${{ needs.build-and-package.outputs.output_root }}'
+        shell: pwsh

@@ -1,0 +1,59 @@
+{
+  "schema_version": 3,
+  "repository": "https://github.com/Conv-AI/Convai-Scene-AutoTagger-Core",
+  "release_tag": "v0.10.0",
+  "release_channel": "unsigned-internal-prerelease",
+  "source_commit": "005257b787014f9f210f15bc57f5f227883dddba",
+  "core_version": "0.10.0",
+  "abi_version": 4,
+  "view_policy_id": "sat-p-02-4b8f19e6",
+  "vision_protocol_id": "sat-vision-v26-domain-neutral-scene-01",
+  "notes": "Immutable tagged Core v0.10.0 ABI4 unsigned internal prerelease from workflow 34234621061. Runtime archives and stripped Core symbols verified. Windows is Unreal-integrated; Linux and macOS remain disabled portability-validated SDKs pending their Unreal gates.",
+  "expected_entry_point": "convai_sat_get_api",
+  "artifacts": {
+    "include/convai_scene_auto_tagger_core.h": {
+      "sha256": "A218770F741E9AD54D556ECC1EC376B2A7EBDABEEADC098E0BB22F443D4E758B"
+    },
+    "Win64/bin/convai_scene_auto_tagger_core.dll": {
+      "sha256": "4754293A5AAC5C775C3A14A8C149008A9101FB2C7B407EC9A69C0F8A70D1C816"
+    },
+    "Win64/bin/convai_http_helper.dll": {
+      "sha256": "797E63841724B869D868195E25DF6BC88556BFE64DD8E28CFC4E48A5445CF711"
+    },
+    "Mac/lib/libconvai_scene_auto_tagger_core.dylib": {
+      "sha256": "26B27B84012A7A96518C87FA88652752F93B424B5680BE4A143C4B23A035EB9F"
+    },
+    "Mac/lib/libconvai_http_helper.dylib": {
+      "sha256": "79A5CB83946EA3DC12779C82B17854030AB4A5DB536C094497415C98D98143B3"
+    },
+    "Linux/x86_64-unknown-linux-gnu/lib/libconvai_scene_auto_tagger_core.so": {
+      "sha256": "5721761469FE0018082EB0A6AF51B2CDBC7C82AADC2003210BDC3E5BA8C5CBBF"
+    },
+    "Linux/x86_64-unknown-linux-gnu/lib/libconvai_http_helper.so": {
+      "sha256": "6D6497CF748EAED9223A778C751A89342003AABAECD93D34FD9EAE533A7C7069"
+    }
+  },
+  "release_archives": {
+    "windows-x86_64": {
+      "name": "convai-scene-auto-tagger-core-v0.10.0-windows-x86_64.zip",
+      "sha256": "DAF88C11967638723377CB982CE21382135CFA9A4594D1D9B387B6EC4C3AD6A3",
+      "workflow_run": 34234621061,
+      "support_level": "unreal-integrated",
+      "unreal_release_eligible": true
+    },
+    "linux-x86_64": {
+      "name": "convai-scene-auto-tagger-core-v0.10.0-linux-x86_64.tar.gz",
+      "sha256": "9BE9D3981DC51113FDB172096D50C9FF1F27960CC55670C65B7A26888438CE3A",
+      "workflow_run": 34234621061,
+      "support_level": "portability-validated",
+      "unreal_release_eligible": false
+    },
+    "macos-universal": {
+      "name": "convai-scene-auto-tagger-core-v0.10.0-macos-universal.tar.gz",
+      "sha256": "4263C1D2195C948DF9D7852AEA5368D455EA9C1040C809A54C8A04A479B46E6A",
+      "workflow_run": 34234621061,
+      "support_level": "portability-validated",
+      "unreal_release_eligible": false
+    }
+  }
+}

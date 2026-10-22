@@ -1,0 +1,729 @@
+// Copyright 2022 Convai Inc. All Rights Reserved.
+
+
+#include "ConvaiAudioCaptureComponent.h"
+#include "ConvaiDefinitions.h"
+#include "Utility/ConvaiEngineCompat.h"
+#include "Utility/Log/ConvaiLogger.h"
+
+DEFINE_LOG_CATEGORY(ConvaiAudioLog);
+
+namespace
+{
+	// A live capture stream delivers a buffer every ~20 ms. When the device dies underneath WASAPI
+	// the stream stays open and "capturing" but the callbacks simply stop.
+	constexpr double CaptureStallSeconds = 2.0;
+}
+
+namespace Audio
+{
+	FConvaiAudioCaptureSynth::FConvaiAudioCaptureSynth()
+		: NumSamplesEnqueued(0)
+		, bInitialized(false)
+		, bIsCapturing(false)
+		, LastCaptureTime(0.0)
+		, bIsBeingDestroyed(MakeShared<FThreadSafeBool, ESPMode::ThreadSafe>(false))
+	{
+	}
+
+	FConvaiAudioCaptureSynth::~FConvaiAudioCaptureSynth()
+	{
+		// Signal the callback lambda that this object is being destroyed.
+		// The lambda holds a copy of this TSharedPtr, so it can safely check
+		// the flag even after our members are freed.
+		*bIsBeingDestroyed = true;
+
+		{
+			FScopeLock Lock(&CaptureCriticalSection);
+			bIsCapturing = false;
+		}
+
+		// AbortStream was already called in BeginDestroy to signal the WASAPI
+		// thread to stop. By now the thread has had time to exit. CloseStream
+		// releases the COM resources safely.
+		if (AudioCapture.IsStreamOpen())
+		{
+			AudioCapture.CloseStream();
+		}
+	}
+
+	TArray<FCaptureDeviceInfo> FConvaiAudioCaptureSynth::GetCaptureDevicesAvailable()
+	{
+		TArray<FCaptureDeviceInfo> CaptureDevicesInfo;
+#if WITH_TESTS
+		if (TestDevices)
+		{
+			CaptureDevicesInfo = TestDevices->Devices;
+			++TestDevices->Enumerations;
+		}
+		else
+#endif
+		{
+			AudioCapture.GetCaptureDevicesAvailable(CaptureDevicesInfo);
+		}
+		for (int i = CaptureDevicesInfo.Num()-1; i>=0; i--)
+		{
+			if (CaptureDevicesInfo[i].InputChannels <= 0)
+				CaptureDevicesInfo.RemoveAt(i);
+		}
+		return CaptureDevicesInfo;
+	}
+
+	bool FConvaiAudioCaptureSynth::GetDefaultCaptureDeviceInfo(FCaptureDeviceInfo& OutInfo)
+	{
+#if WITH_TESTS
+		if (TestDevices)
+		{
+			if (TestDevices->Default.IsSet())
+			{
+				OutInfo = TestDevices->Default.GetValue();
+			}
+			return TestDevices->Default.IsSet();
+		}
+#endif
+		return AudioCapture.GetCaptureDeviceInfo(OutInfo);
+	}
+
+	bool FConvaiAudioCaptureSynth::GetCaptureDeviceInfo(FCaptureDeviceInfo& OutInfo, int32 DeviceIndex)
+	{
+		// DeviceIndex is a 0-based index into the input-capable devices. Resolve it from
+		// the engine's input-only device list (which is bounded by the real device count)
+		// rather than walking absolute device indices until the backend reports "past the
+		// end". The RtAudio backend used on macOS returns success for EVERY index (errors
+		// go to a callback, not an exception), so such a loop never terminates and hangs
+		// the game thread on machines with no matching input device.
+		TArray<FCaptureDeviceInfo> InputDevices = GetCaptureDevicesAvailable();
+		if (DeviceIndex >= 0 && DeviceIndex < InputDevices.Num())
+		{
+			OutInfo = InputDevices[DeviceIndex];
+			return true;
+		}
+		return false;
+	}
+
+	void FConvaiAudioCaptureSynth::OnAudioCaptured(const float* AudioData, int32 NumFrames, int32 NumChannels, int32 SampleRate)
+	{
+		LastCaptureTime.store(FPlatformTime::Seconds(), std::memory_order_relaxed);
+
+		if (!AudioData || NumFrames <= 0 || NumChannels <= 0)
+		{
+			return;
+		}
+
+		// UConvaiAudioCaptureComponent::Init renders a mono device as stereo; see there.
+		const int32 QueueChannels = NumChannels == 1 ? 2 : NumChannels;
+		// A paused world stops the render thread's pulls but not the device, so this callback is the
+		// only place the queue can be bounded. The newest half second survives; the rest of the pause
+		// would only reach the character as stale audio, and grow until it exhausted memory.
+		const int32 MaxQueuedFrames = FMath::Max(1, (SampleRate > 0 ? SampleRate : 48000) / 2);
+		const int32 SkippedFrames = FMath::Max(0, NumFrames - MaxQueuedFrames);
+		const int32 KeptFrames = NumFrames - SkippedFrames;
+		const float* In = AudioData + SkippedFrames * NumChannels;
+		bool bWarnOverflow = false;
+		{
+			FScopeLock Lock(&CaptureCriticalSection);
+
+			if (!bIsCapturing)
+			{
+				return;
+			}
+
+			const int32 QueuedFrames = AudioCaptureData.Num() / QueueChannels;
+			const int32 DroppedFrames = FMath::Max(0, QueuedFrames + KeptFrames - MaxQueuedFrames);
+			if (DroppedFrames > 0 || SkippedFrames > 0)
+			{
+				AudioCaptureData.RemoveAt(0, DroppedFrames * QueueChannels, CONVAI_ALLOW_SHRINKING_NO);
+				bWarnOverflow = !bWarnedQueueOverflow;
+				bWarnedQueueOverflow = true;
+			}
+
+			const int32 Index = AudioCaptureData.AddUninitialized(KeptFrames * QueueChannels);
+			float* Out = AudioCaptureData.GetData() + Index;
+			if (NumChannels == 1)
+			{
+				for (int32 Frame = 0; Frame < KeptFrames; ++Frame)
+				{
+					Out[Frame * 2] = In[Frame];
+					Out[Frame * 2 + 1] = In[Frame];
+				}
+			}
+			else
+			{
+				FMemory::Memcpy(Out, In, KeptFrames * NumChannels * sizeof(float));
+			}
+		}
+
+		if (bWarnOverflow)
+		{
+			CONVAI_LOG(ConvaiAudioLog, Warning, TEXT("Microphone capture is not being read (a paused game stops it); keeping only the newest 0.5 s of audio until it is."));
+		}
+	}
+
+	bool FConvaiAudioCaptureSynth::OpenDefaultStream()
+	{
+		return OpenStream(DefaultDeviceIndex);
+	}
+
+	bool FConvaiAudioCaptureSynth::OpenStream(int32 DeviceIndex)
+	{
+#if WITH_TESTS
+		if (TestDevices)
+		{
+			TestDevices->OpenedIndices.Add(DeviceIndex);
+			return true;
+		}
+#endif
+		bool bSuccess = true;
+		if (!AudioCapture.IsStreamOpen())
+		{
+			// Capture the shared destroyed flag by value so the lambda can safely
+			// check it even after FConvaiAudioCaptureSynth is freed
+			TSharedPtr<FThreadSafeBool, ESPMode::ThreadSafe> DestroyedFlag = bIsBeingDestroyed;
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 3
+			Audio::FOnAudioCaptureFunction OnCapture = [this, DestroyedFlag](const void* AudioData, int32 NumFrames, int32 NumChannels, int32 SampleRate, double StreamTime, bool bOverFlow)
+			{
+				if (*DestroyedFlag) return;
+				OnAudioCaptured(static_cast<const float*>(AudioData), NumFrames, NumChannels, SampleRate);
+			};
+#else
+			FOnCaptureFunction OnCapture = [this, DestroyedFlag](const float* AudioData, int32 NumFrames, int32 NumChannels, int32 SampleRate, double StreamTime, bool bOverFlow)
+			{
+				if (*DestroyedFlag) return;
+				// RtAudio backend (UE <= 5.2) can deliver degenerate buffers on overflow / device hiccups.
+				if (!AudioData) return;
+				if (NumFrames <= 0 || NumChannels <= 0 || NumChannels > 8) return;
+				if (static_cast<int64>(NumFrames) * NumChannels > 2 * 2 * 48000) return;
+				OnAudioCaptured(AudioData, NumFrames, NumChannels, SampleRate);
+			};
+#endif
+
+			// Prepare the audio buffer memory for 2 seconds of stereo audio at 48k SR to reduce chance for allocation in callbacks
+			AudioCaptureData.Reserve(2 * 2 * 48000);
+
+			FAudioCaptureDeviceParams Params = FAudioCaptureDeviceParams();
+			Params.DeviceIndex = DeviceIndex;
+			// Start the stream here to avoid hitching the audio render thread. 
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 3
+			if (AudioCapture.OpenAudioCaptureStream(Params, MoveTemp(OnCapture), 1024))
+#else
+			if (AudioCapture.OpenCaptureStream(Params, MoveTemp(OnCapture), 1024))
+#endif
+			{
+				AudioCapture.StartStream();
+			}
+			else
+			{
+				bSuccess = false;
+			}
+		}
+		return bSuccess;
+	}
+
+	void FConvaiAudioCaptureSynth::CloseStream()
+	{
+		if (AudioCapture.IsStreamOpen())
+		{
+			AudioCapture.CloseStream();
+		}
+	}
+
+	bool FConvaiAudioCaptureSynth::StartCapturing()
+	{
+		FScopeLock Lock(&CaptureCriticalSection);
+
+		AudioCaptureData.Reset();
+		bWarnedQueueOverflow = false;
+
+		if (!AudioCapture.IsStreamOpen())
+		{
+			return false;
+		}
+
+		LastCaptureTime.store(FPlatformTime::Seconds(), std::memory_order_relaxed);
+		bIsCapturing = true;
+		return true;
+	}
+
+	void FConvaiAudioCaptureSynth::StopCapturing()
+	{
+		FScopeLock Lock(&CaptureCriticalSection);
+		bIsCapturing = false;
+	}
+
+	void FConvaiAudioCaptureSynth::AbortCapturing()
+	{
+		AudioCapture.AbortStream();
+		AudioCapture.CloseStream();
+	}
+
+	bool FConvaiAudioCaptureSynth::IsStreamOpen() const
+	{
+		return AudioCapture.IsStreamOpen();
+	}
+
+	bool FConvaiAudioCaptureSynth::IsCapturing() const
+	{
+		return bIsCapturing;
+	}
+
+	double FConvaiAudioCaptureSynth::SecondsSinceLastCapture() const
+	{
+		return FPlatformTime::Seconds() - LastCaptureTime.load(std::memory_order_relaxed);
+	}
+
+	int32 FConvaiAudioCaptureSynth::GetNumSamplesEnqueued()
+	{
+		FScopeLock Lock(&CaptureCriticalSection);
+		return AudioCaptureData.Num();
+	}
+
+	FAudioCapture* FConvaiAudioCaptureSynth::GetAudioCapture()
+	{
+		return &AudioCapture;
+	}
+
+	void FConvaiAudioCaptureSynth::MarkBeingDestroyed()
+	{
+		*bIsBeingDestroyed = true;
+	}
+
+	bool FConvaiAudioCaptureSynth::GetAudioData(TArray<float>& OutAudioData)
+	{
+		FScopeLock Lock(&CaptureCriticalSection);
+
+		int32 CaptureDataSamples = AudioCaptureData.Num();
+		if (CaptureDataSamples > 0)
+		{
+			// Append the capture audio to the output buffer
+			int32 OutIndex = OutAudioData.AddUninitialized(CaptureDataSamples);
+			float* OutDataPtr = OutAudioData.GetData();
+			FMemory::Memcpy(&OutDataPtr[OutIndex], AudioCaptureData.GetData(), CaptureDataSamples * sizeof(float));
+
+			// Reset the capture data buffer since we copied the audio out
+			AudioCaptureData.Reset();
+			return true;
+		}
+		return false;
+	}
+};
+
+UConvaiAudioCaptureComponent::UConvaiAudioCaptureComponent(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	bSuccessfullyInitialized = false;
+	bIsCapturing = false;
+	CapturedAudioDataSamples = 0;
+	ReadSampleIndex = 0;
+	bIsDestroying = false;
+	bIsNotReadyForForFinishDestroy = false;
+	bIsStreamOpen = false;
+	// Instances only: a class default object or archetype never renders. Not in Init either, which
+	// runs on the game thread while the previous source's render callback may still use the buffer.
+	if (!HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject))
+	{
+		CaptureAudioData.Reserve(2 * 48000 * 5);
+	}
+	SelectedDeviceIndex = -1;
+}
+
+bool UConvaiAudioCaptureComponent::Init(int32& SampleRate)
+{
+
+	Audio::FCaptureDeviceInfo DeviceInfo{};
+	bool FoundDevice = false;
+	SelectedDeviceIndex = -1;
+	if (!SelectedDeviceId.IsEmpty())
+	{
+		const TArray<Audio::FCaptureDeviceInfo> Devices = CaptureSynth.GetCaptureDevicesAvailable();
+		SelectedDeviceIndex = Devices.IndexOfByPredicate([this](const Audio::FCaptureDeviceInfo& Device)
+		{
+			return Device.DeviceId == SelectedDeviceId;
+		});
+		FoundDevice = Devices.IsValidIndex(SelectedDeviceIndex);
+		if (FoundDevice)
+		{
+			DeviceInfo = Devices[SelectedDeviceIndex];
+		}
+		else
+		{
+			CONVAI_LOG(ConvaiAudioLog, Warning, TEXT("The selected microphone is not connected; using the system default until it is back."));
+		}
+	}
+
+	if (!FoundDevice)
+	{
+		FoundDevice = CaptureSynth.GetDefaultCaptureDeviceInfo(DeviceInfo);
+
+		// The engine's default-capture query resolves to the host's default *input*
+		// device, but on some hosts it comes back as an output-only device with zero
+		// input channels (e.g. macOS when no default input is configured), which can
+		// never capture. In that case fall back to the first real input device.
+		if (!FoundDevice || DeviceInfo.InputChannels <= 0)
+		{
+			Audio::FCaptureDeviceInfo InputDeviceInfo;
+			if (CaptureSynth.GetCaptureDeviceInfo(InputDeviceInfo, 0) && InputDeviceInfo.InputChannels > 0)
+			{
+				DeviceInfo = InputDeviceInfo;
+				SelectedDeviceIndex = 0; // input-device index; the engine maps it to the real device on OpenStream
+				FoundDevice = true;
+			}
+		}
+	}
+
+	CONVAI_LOG(ConvaiAudioLog, Log, TEXT("Using %s as Audio capture device with NumChannels:%d and SampleRate:%d"), *DeviceInfo.DeviceName, DeviceInfo.InputChannels, DeviceInfo.PreferredSampleRate);
+
+	// Stop() leaves the stream open (see OnEndGenerate), so a device that changed between Stop and
+	// Start has to be applied here or OpenStream keeps the old one while this log claims the new.
+	if (CaptureSynth.IsStreamOpen() && DeviceInfo.DeviceId != ActiveDeviceInfo.DeviceId)
+	{
+		CloseCaptureStream();
+	}
+	ActiveDeviceInfo = DeviceInfo;
+
+	if (FoundDevice)
+	{
+		SampleRate = DeviceInfo.PreferredSampleRate;
+		CaptureSampleRate.store(SampleRate, std::memory_order_relaxed);
+		NumChannels = DeviceInfo.InputChannels;
+
+		if (NumChannels <= 0)
+		{
+			// No usable input device. Common on desktops/Mac minis with no built-in
+			// or attached microphone (the selected device is output-only). This is a
+			// hardware/config issue, not a permission one — say so plainly.
+			CONVAI_LOG(ConvaiAudioLog, Error, TEXT("No audio input (microphone) device found - '%s' reports %d input channels. Connect a microphone/input device; Convai cannot capture audio without one."), *DeviceInfo.DeviceName, NumChannels);
+			return true;
+		}
+		if (NumChannels > 2)
+		{
+			CONVAI_LOG(ConvaiAudioLog, Warning, TEXT("Audio capture components only support mono and stereo mic input - Audio might be mangeled."));
+		}
+
+		// The engine mixes a mono 2D source into the stereo AudioInput submix at the project's
+		// mono upmix law (Linear by default: half on each side), which would put a mono microphone
+		// 6 dB under a stereo one. OnAudioCaptured writes a mono device to both channels.
+		if (NumChannels == 1)
+		{
+			NumChannels = 2;
+		}
+
+		// This may fail if capture synths aren't supported on a given platform or if something went wrong with the capture device
+		bIsStreamOpen = CaptureSynth.OpenStream(SelectedDeviceIndex);
+		if (!bIsStreamOpen)
+		{
+			CONVAI_LOG(ConvaiAudioLog, Warning, TEXT("OpenStream returned false."));
+		}
+		return true;
+	}
+	return false;
+}
+
+void UConvaiAudioCaptureComponent::BeginDestroy()
+{
+	bIsDestroying = true;
+	bIsNotReadyForForFinishDestroy = false;
+
+	// Signal the capture callback as early as possible. RtAudio's worker thread
+	// (UE <= 5.2) keeps firing callbacks until the stream is actually closed,
+	// which doesn't happen until ~FConvaiAudioCaptureSynth runs. Flipping the
+	// shared flag here closes the window where a callback could enter
+	// OnAudioCaptured on a partially-destroyed object.
+	CaptureSynth.MarkBeingDestroyed();
+
+	if (CaptureSynth.IsCapturing())
+	{
+		CaptureSynth.StopCapturing();
+	}
+
+	// Signal the WASAPI thread to stop, but do NOT call CloseStream here.
+	// AbortStream just sets the stop flag — it doesn't release COM objects.
+	// CloseStream will run later in ~FConvaiAudioCaptureSynth, by which time
+	// the thread has had time to exit the blocking GetBuffer call.
+	if (CaptureSynth.IsStreamOpen())
+	{
+		CaptureSynth.GetAudioCapture()->AbortStream();
+	}
+	bIsStreamOpen = false;
+
+	Stop();
+
+	Super::BeginDestroy();
+}
+
+bool UConvaiAudioCaptureComponent::IsReadyForFinishDestroy()
+{
+	return !bIsNotReadyForForFinishDestroy;
+}
+
+void UConvaiAudioCaptureComponent::FinishDestroy()
+{
+	// Stream closure is handled by ~FConvaiAudioCaptureSynth -> ~FAudioCapture
+	// which properly joins the WASAPI thread before releasing COM resources
+
+	Super::FinishDestroy();
+	bSuccessfullyInitialized = false;
+	bIsCapturing = false;
+	bIsDestroying = false;
+	bIsStreamOpen = false;
+}
+
+bool UConvaiAudioCaptureComponent::GetDefaultCaptureDeviceInfo(Audio::FCaptureDeviceInfo& OutInfo)
+{
+	return CaptureSynth.GetDefaultCaptureDeviceInfo(OutInfo);
+}
+
+bool UConvaiAudioCaptureComponent::GetCaptureDeviceInfo(Audio::FCaptureDeviceInfo& OutInfo, int32 DeviceIndex)
+{
+	return CaptureSynth.GetCaptureDeviceInfo(OutInfo, DeviceIndex);
+}
+
+TArray<Audio::FCaptureDeviceInfo> UConvaiAudioCaptureComponent::GetCaptureDevicesAvailable()
+{
+	return CaptureSynth.GetCaptureDevicesAvailable();
+}
+
+int32 UConvaiAudioCaptureComponent::GetActiveCaptureDevice(Audio::FCaptureDeviceInfo& OutInfo)
+{
+	if (SelectedDeviceIndex == -1)
+		GetDefaultCaptureDeviceInfo(OutInfo);
+	else
+		GetCaptureDeviceInfo(OutInfo, SelectedDeviceIndex);
+	return SelectedDeviceIndex;
+}
+
+bool UConvaiAudioCaptureComponent::SetCaptureDevice(int32 DeviceIndex)
+{
+	// Re-asserting the current choice costs no enumeration, which is a full device scan on the game
+	// thread. Two independent callers re-assert the saved device: UConvaiPlayerComponent::BeginPlay
+	// and, when the Convai Helper Library is installed, its settings subsystem's 1 Hz device watcher.
+	if (DeviceIndex >= 0 && DeviceIndex == SelectedDeviceIndex && !SelectedDeviceId.IsEmpty()
+		&& (!bIsStreamOpen || IsCaptureStreamHealthy()))
+	{
+		return true;
+	}
+
+	Audio::FCaptureDeviceInfo Device;
+	if (!GetCaptureDeviceInfo(Device, DeviceIndex))
+	{
+		return false;
+	}
+	return SelectCaptureDevice(Device, DeviceIndex);
+}
+
+bool UConvaiAudioCaptureComponent::SelectCaptureDevice(const Audio::FCaptureDeviceInfo& Device, int32 DeviceIndex)
+{
+	// Already capturing from this device, or no stream to disturb yet: record the choice without
+	// tearing WASAPI down and back up. Compared by id, because the same device's index moves.
+	const bool bStreamOnDevice = bIsStreamOpen && Device.DeviceId == ActiveDeviceInfo.DeviceId && IsCaptureStreamHealthy();
+	if (bStreamOnDevice || (!bIsStreamOpen && Device.DeviceId == SelectedDeviceId))
+	{
+		SelectedDeviceId = Device.DeviceId;
+		SelectedDeviceIndex = DeviceIndex;
+		return true;
+	}
+
+	const bool bWasActive = bIsStreamOpen;
+
+	CloseCaptureStream();
+
+	SelectedDeviceId = Device.DeviceId;
+	SelectedDeviceIndex = DeviceIndex;
+
+	if (bWasActive)
+	{
+		Start();
+		if (!bIsStreamOpen)
+		{
+			CONVAI_LOG(ConvaiAudioLog, Warning, TEXT("SetCaptureDevice: OpenStream failed for device index %d"), SelectedDeviceIndex);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void UConvaiAudioCaptureComponent::CloseCaptureStream()
+{
+	// Game thread only: CloseStream joins the WASAPI worker, which is why OnEndGenerate
+	// (render thread) only clears flags and never closes.
+	// Quiesce the audio render thread first so OnGenerateAudio cannot enter
+	// CaptureSynth while we tear the stream down.
+	Stop();
+
+	if (CaptureSynth.IsCapturing())
+	{
+		CaptureSynth.StopCapturing();
+	}
+
+	if (CaptureSynth.IsStreamOpen())
+	{
+		// AbortStream signals the WASAPI worker before CloseStream waits on it.
+		CaptureSynth.GetAudioCapture()->AbortStream();
+		CaptureSynth.CloseStream();
+	}
+	bIsStreamOpen = false;
+}
+
+bool UConvaiAudioCaptureComponent::IsCaptureStreamHealthy() const
+{
+	return bIsStreamOpen && CaptureSynth.IsStreamOpen() && CaptureSynth.IsCapturing()
+		&& CaptureSynth.SecondsSinceLastCapture() < CaptureStallSeconds;
+}
+
+void UConvaiAudioCaptureComponent::RestartCapture()
+{
+	FString Reason;
+	if (!bIsStreamOpen || !CaptureSynth.IsStreamOpen())
+	{
+		Reason = TEXT("stream not open");
+	}
+	else if (!CaptureSynth.IsCapturing())
+	{
+		Reason = TEXT("not capturing");
+	}
+	else
+	{
+		Reason = FString::Printf(TEXT("no capture callbacks for %.1fs"), CaptureSynth.SecondsSinceLastCapture());
+	}
+	const Audio::FCaptureDeviceInfo OldDevice = ActiveDeviceInfo;
+
+	CloseCaptureStream();
+	Start();
+
+	// Log, not Warning: the player's health check is the only caller, and it warns once per run of
+	// failed restarts. A machine with no microphone restarts every 30 s for as long as capture runs.
+	CONVAI_LOG(ConvaiAudioLog, Log, TEXT("Restarted microphone capture (%s): %s %dch@%dHz -> %s %dch@%dHz%s"),
+		*Reason,
+		*OldDevice.DeviceName, OldDevice.InputChannels, OldDevice.PreferredSampleRate,
+		*ActiveDeviceInfo.DeviceName, ActiveDeviceInfo.InputChannels, ActiveDeviceInfo.PreferredSampleRate,
+		bIsStreamOpen ? TEXT("") : TEXT(" (open failed)"));
+}
+
+Audio::FConvaiAudioCaptureSynth* UConvaiAudioCaptureComponent::GetCaptureSynth()
+{
+	return &CaptureSynth;
+}
+
+void UConvaiAudioCaptureComponent::PullCapturedAudio(int32 NumSamples)
+{
+	CaptureAudioData.Reset();
+	CaptureSynth.GetAudioData(CaptureAudioData);
+	ReadSampleIndex = 0;
+
+	// Each callback emits at most NumSamples, so a backlog is never worked off: after a pause, or as
+	// the device and output clocks drift, it is latency on everything the player says. Past a jitter
+	// allowance of 100 ms or two blocks, whichever is larger (iOS renders 8192-sample blocks), only
+	// the newest block is kept.
+	const int32 Channels = FMath::Max(1, NumChannels);
+	const int32 HighWaterSamples = FMath::Max(CaptureSampleRate.load(std::memory_order_relaxed) / 10 * Channels, 2 * NumSamples);
+	if (CaptureAudioData.Num() > HighWaterSamples)
+	{
+		CaptureAudioData.RemoveAt(0, (CaptureAudioData.Num() - NumSamples) / Channels * Channels, CONVAI_ALLOW_SHRINKING_NO);
+	}
+}
+
+void UConvaiAudioCaptureComponent::OnBeginGenerate()
+{
+	CapturedAudioDataSamples = 0;
+	ReadSampleIndex = 0;
+	CaptureAudioData.Reset();
+
+	// Init (game thread) is the only place a stream is opened, so its NumChannels/SampleRate always
+	// describe the device actually bound. Re-sync the flag: the previous source's OnEndGenerate
+	// lands after Init re-set it on a Stop();Start() pair.
+	bIsStreamOpen = CaptureSynth.IsStreamOpen();
+
+	if (bIsStreamOpen)
+	{
+		if (!CaptureSynth.StartCapturing())
+		{
+			bIsStreamOpen = false;
+			return;
+		}
+
+		bIsNotReadyForForFinishDestroy = true;
+		FramesSinceStarting = 0;
+		ReadSampleIndex = 0;
+	}
+
+}
+
+void UConvaiAudioCaptureComponent::OnEndGenerate()
+{
+	if (bIsStreamOpen)
+	{
+		if (!CaptureSynth.IsStreamOpen())
+		{
+			CONVAI_LOG(ConvaiAudioLog, Verbose, TEXT("OnEndGenerate: stream already closed by BeginDestroy"));
+			bIsStreamOpen = false;
+			bIsNotReadyForForFinishDestroy = false;
+			return;
+		}
+		// Only stop capturing (flag), do NOT close/abort the stream from the audio render thread.
+		// Closing the stream here can race with the WASAPI capture thread.
+		// The stream is closed on the game thread: CloseCaptureStream, BeginDestroy or ~FConvaiAudioCaptureSynth.
+		CaptureSynth.StopCapturing();
+		bIsStreamOpen = false;
+
+		bIsNotReadyForForFinishDestroy = false;
+	}
+}
+
+int32 UConvaiAudioCaptureComponent::OnGenerateAudio(float* OutAudio, int32 NumSamples)
+{
+	// Don't do anything if the stream isn't open
+	if (!bIsStreamOpen || !CaptureSynth.IsStreamOpen() || !CaptureSynth.IsCapturing())
+	{
+		// Just return NumSamples, which uses zero'd buffer
+		return NumSamples;
+	}
+
+	int32 OutputSamplesGenerated = 0;
+
+	if (CapturedAudioDataSamples > 0 || CaptureSynth.GetNumSamplesEnqueued() > 1024)
+	{
+		// Check if we need to read more audio data from capture synth
+		if (ReadSampleIndex + NumSamples > CaptureAudioData.Num())
+		{
+			// but before we do, copy off the remainder of the capture audio data buffer if there's data in it
+			int32 SamplesLeft = FMath::Max(0, CaptureAudioData.Num() - ReadSampleIndex);
+			if (SamplesLeft > 0)
+			{
+				float* CaptureDataPtr = CaptureAudioData.GetData();
+				if (CaptureDataPtr)
+				{
+					FMemory::Memcpy(OutAudio, &CaptureDataPtr[ReadSampleIndex], SamplesLeft * sizeof(float));
+					// Track samples generated
+					OutputSamplesGenerated += SamplesLeft;
+				}
+			}
+
+			PullCapturedAudio(NumSamples);
+		}
+
+		// note it's possible we didn't get any more audio in our last attempt to get it
+		if (CaptureAudioData.Num() > 0)
+		{
+			// Compute samples to copy
+			int32 NumSamplesToCopy = FMath::Min(NumSamples - OutputSamplesGenerated, CaptureAudioData.Num() - ReadSampleIndex);
+
+			float* CaptureDataPtr = CaptureAudioData.GetData();
+			if (CaptureDataPtr)
+			{
+				FMemory::Memcpy(&OutAudio[OutputSamplesGenerated], &CaptureDataPtr[ReadSampleIndex], NumSamplesToCopy * sizeof(float));
+				ReadSampleIndex += NumSamplesToCopy;
+				OutputSamplesGenerated += NumSamplesToCopy;
+			}
+		}
+
+		CapturedAudioDataSamples += OutputSamplesGenerated;
+	}
+	else
+	{
+		// Say we generated the full samples, this will result in silence
+		OutputSamplesGenerated = NumSamples;
+	}
+
+	return OutputSamplesGenerated;
+}
+

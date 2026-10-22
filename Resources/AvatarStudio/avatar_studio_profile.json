@@ -1,0 +1,361 @@
+{
+  "schema_version": 1,
+  "profile_id": "cloud-avatars-project-profile-v1",
+  "source_url": "https://github.com/Conv-AI/Convai-UnrealEngine-ModdingTool/blob/5133b6072915d888d5b5bc1c78683f44287361e3/core/unreal_engine_manager.py",
+  "settings": [
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.GenerateMeshDistanceFields",
+      "values": [
+        "r.GenerateMeshDistanceFields=True"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.DynamicGlobalIlluminationMethod",
+      "values": [
+        "r.DynamicGlobalIlluminationMethod=0"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.ReflectionMethod",
+      "values": [
+        "r.ReflectionMethod=2"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.RayTracing",
+      "values": [
+        "r.RayTracing=False"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.Shadow.Virtual.Enable",
+      "values": [
+        "r.Shadow.Virtual.Enable=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.GPUSkin.Support16BitBoneIndex",
+      "values": [
+        "r.GPUSkin.Support16BitBoneIndex=True"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.GPUSkin.UnlimitedBoneInfluences",
+      "values": [
+        "r.GPUSkin.UnlimitedBoneInfluences=True"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "SkeletalMesh.UseExperimentalChunking",
+      "values": [
+        "SkeletalMesh.UseExperimentalChunking=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.VirtualTextures",
+      "values": [
+        "r.VirtualTextures=True"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.SkinCache.CompileShaders",
+      "values": [
+        "r.SkinCache.CompileShaders=True"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.SkinCache.BlendUsingVertexColorForRecomputeTangents",
+      "values": [
+        "r.SkinCache.BlendUsingVertexColorForRecomputeTangents=2"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.SkinCache.SceneMemoryLimitInMB",
+      "values": [
+        "r.SkinCache.SceneMemoryLimitInMB=1500.000000"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.SkinCache.DefaultBehavior",
+      "values": [
+        "r.SkinCache.DefaultBehavior=0"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.SkyLighting",
+      "values": [
+        "r.HairStrands.SkyLighting=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.SkyAO",
+      "values": [
+        "r.HairStrands.SkyAO=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Visibility.MaterialPass",
+      "values": [
+        "r.HairStrands.Visibility.MaterialPass=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Visibility.FullCoverageThreshold",
+      "values": [
+        "r.HairStrands.Visibility.FullCoverageThreshold=0.9"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Visibility.MSAA.MeanSamplePerPixel",
+      "values": [
+        "r.HairStrands.Visibility.MSAA.MeanSamplePerPixel=1.0"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.RasterizationScale",
+      "values": [
+        "r.HairStrands.RasterizationScale=1.0"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.DensityScale",
+      "values": [
+        "r.HairStrands.Voxelization.DensityScale=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.DepthBiasScale_Shadow",
+      "values": [
+        "r.HairStrands.Voxelization.DepthBiasScale_Shadow=2"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.DepthBiasScale_Light",
+      "values": [
+        "r.HairStrands.Voxelization.DepthBiasScale_Light=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.DepthBiasScale_Environment",
+      "values": [
+        "r.HairStrands.Voxelization.DepthBiasScale_Environment=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.GPUDriven",
+      "values": [
+        "r.HairStrands.Voxelization.GPUDriven=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.Virtual.VoxelWorldSize",
+      "values": [
+        "r.HairStrands.Voxelization.Virtual.VoxelWorldSize=0.15"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.Virtual.VoxelPageCountPerDim",
+      "values": [
+        "r.HairStrands.Voxelization.Virtual.VoxelPageCountPerDim=9"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.Raymarching.SteppingScale",
+      "values": [
+        "r.HairStrands.Voxelization.Raymarching.SteppingScale=1.0"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.Voxelization.Raymarching.SteppingScale.Shadow",
+      "values": [
+        "r.HairStrands.Voxelization.Raymarching.SteppingScale.Shadow=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.DeepShadow.RandomType",
+      "values": [
+        "r.HairStrands.DeepShadow.RandomType=2"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.ComposeAfterTranslucency",
+      "values": [
+        "r.HairStrands.ComposeAfterTranslucency=0"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.AsyncLoad",
+      "values": [
+        "r.HairStrands.AsyncLoad=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.BindingAsyncLoad",
+      "values": [
+        "r.HairStrands.BindingAsyncLoad=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.SimulationRestUpdate",
+      "values": [
+        "r.HairStrands.SimulationRestUpdate=1"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.MaxSimulatedLOD",
+      "values": [
+        "r.HairStrands.MaxSimulatedLOD=0"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.HairStrands.LODMode",
+      "values": [
+        "r.HairStrands.LODMode=False"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.ReflectionCaptureResolution",
+      "values": [
+        "r.ReflectionCaptureResolution=512"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/Engine.RendererSettings",
+      "key": "r.AllowStaticLighting",
+      "values": [
+        "r.AllowStaticLighting=True"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/WindowsTargetPlatform.WindowsTargetSettings",
+      "key": "DefaultGraphicsRHI",
+      "values": [
+        "DefaultGraphicsRHI=DefaultGraphicsRHI_DX12"
+      ]
+    },
+    {
+      "file": "DefaultEngine.ini",
+      "section": "/Script/WindowsTargetPlatform.WindowsTargetSettings",
+      "key": "D3D12TargetedShaderFormats",
+      "values": [
+        "-D3D12TargetedShaderFormats=PCD3D_SM5",
+        "+D3D12TargetedShaderFormats=PCD3D_SM6"
+      ]
+    },
+    {
+      "file": "DefaultGame.ini",
+      "section": "/Script/UnrealEd.ProjectPackagingSettings",
+      "key": "bUseIoStore",
+      "values": [
+        "bUseIoStore=False"
+      ]
+    },
+    {
+      "file": "DefaultGame.ini",
+      "section": "/Script/UnrealEd.ProjectPackagingSettings",
+      "key": "bGenerateChunks",
+      "values": [
+        "bGenerateChunks=True"
+      ]
+    },
+    {
+      "file": "DefaultGame.ini",
+      "section": "/Script/UnrealEd.ProjectPackagingSettings",
+      "key": "bShareMaterialShaderCode",
+      "values": [
+        "bShareMaterialShaderCode=False"
+      ]
+    },
+    {
+      "file": "DefaultGame.ini",
+      "section": "/Script/UnrealEd.ProjectPackagingSettings",
+      "key": "UsePakFile",
+      "values": [
+        "UsePakFile=True"
+      ]
+    }
+  ],
+  "compression": {
+    "format": "Zlib"
+  },
+  "notes": [
+    "Reviewed rendering, RHI and legacy-pak settings from the V0 template; runtime code does not execute the Python template.",
+    "V1 builds a content-only avatar pak. Shipping is the requested runtime configuration, not a Shipping editor or SDK build.",
+    "Zlib preserves the existing verified avatar-pak codec. Shipping and Development do not inherently change its compression.",
+    "Credentials, network verification, input, sample GameMode, unrelated mobile/audio defaults, and Blueprint development-node behavior are excluded."
+  ]
+}
